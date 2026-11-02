@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Inherit default configuration and dependency versions from Spring Boot -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.2</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>simple-spring-boot-app</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>simple-spring-boot-app</name>
+    <description>Simple Spring Boot REST API application</description>
+
+    <properties>
+        <java.version>21</java.version>
+        <!--
+            Build number used in the JAR name. Local builds use 0.
+            Jenkins overrides it with its own build number: mvnw package -DbuildNumber=${BUILD_NUMBER}
+        -->
+        <buildNumber>0</buildNumber>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Web (Spring MVC + embedded Tomcat) for building REST APIs -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+
+        <!-- Testing support for Spring MVC: JUnit 5, MockMvc, AssertJ -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <!-- Name of the packaged JAR: simple-spring-boot-app-v0.jar locally, -v42.jar for Jenkins build #42 -->
+        <finalName>${project.artifactId}-v${buildNumber}</finalName>
+
+        <plugins>
+            <!-- Packages the application as an executable JAR and provides 'mvn spring-boot:run' -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
