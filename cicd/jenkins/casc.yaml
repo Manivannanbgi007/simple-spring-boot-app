@@ -44,6 +44,11 @@ unclassified:
         # Jenkins accepts a quality gate result only if SonarQube signed it with this secret
         webhookSecretId: "sonarqube-webhook-secret"
 
+  # GitHub webhook (POST /github-webhook/): Jenkins accepts a push event only if GitHub signed it with this secret
+  gitHubPluginConfig:
+    hookSecretConfigs:
+      - credentialsId: "github-webhook-secret"
+
 # Pipeline Graph View (Manage Jenkins -> Appearance): the stages as a diagram on the job page and on every
 # build page, with the name and duration of each stage
 appearance:
@@ -72,6 +77,11 @@ credentials:
               password: "${github_token:-}"
           - string:
               scope: GLOBAL
+              id: "github-webhook-secret"
+              description: "Secret of the GitHub webhook (cicd/.env: GITHUB_WEBHOOK_SECRET)"
+              secret: "${github_webhook_secret:-}"
+          - string:
+              scope: GLOBAL
               id: "sonarqube-token"
               description: "SonarQube token (cicd/.env: SONAR_TOKEN)"
               secret: "${sonar_token:-}"
@@ -89,12 +99,8 @@ jobs:
         properties {
           pipelineTriggers {
             triggers {
-              // "Poll SCM": every ~2 minutes Jenkins asks GitHub for new commits and builds if there are any.
-              // Works on a PC without a public address. For instant builds through a GitHub webhook
-              // (EC2, or a PC with ngrok) use githubPush() instead.
-              pollSCM {
-                scmpoll_spec('H/2 * * * *')
-              }
+              // "GitHub hook trigger for GITScm polling": a GitHub webhook starts a build on every push
+              githubPush()
             }
           }
         }

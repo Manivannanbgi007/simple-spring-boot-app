@@ -268,6 +268,7 @@ Fill in these values (every variable is explained in [.env – all settings](#en
 | `DOCKERHUB_TOKEN`        | The Docker Hub token from Step 4                                                  |
 | `SONARQUBE_DB_PASSWORD`  | A strong password for SonarQube's database – choose it now and keep it            |
 | `SONAR_WEBHOOK_SECRET`   | A long random text (command below) – you also type it into SonarQube in Step 7    |
+| `GITHUB_WEBHOOK_SECRET`  | Another long random text (same command) – you also type it into GitHub in Step 11 |
 | `SONAR_TOKEN`            | **Leave empty for now** – SonarQube creates it in Step 7                          |
 
 Create a random secret in PowerShell:
@@ -372,7 +373,7 @@ Everything is already configured by `jenkins/casc.yaml` – check that it is the
 | Where                                                | What you should see                                                        |
 |------------------------------------------------------|----------------------------------------------------------------------------|
 | Dashboard                                            | The job **simple-spring-boot-app**, and a message that Jenkins is configured by `casc.yaml` |
-| **Manage Jenkins** → **Credentials**                 | `dockerhub-credentials`, `github-credentials`, `sonarqube-token`, `sonarqube-webhook-secret` |
+| **Manage Jenkins** → **Credentials**                 | `dockerhub-credentials`, `github-credentials`, `github-webhook-secret`, `sonarqube-token`, `sonarqube-webhook-secret` |
 | **Manage Jenkins** → **System** → *SonarQube servers* | `SonarQube` – `http://sonarqube:9000` – token `sonarqube-token`            |
 | **Manage Jenkins** → **Appearance** → *Pipeline Graph View* | Graph on job page and build page, stage names and durations – all ticked |
 | **Manage Jenkins** → **Plugins** → **Installed plugins** | Configuration as Code, Job DSL, Pipeline, Git, GitHub, Credentials Binding, JUnit, Pipeline Graph View, SonarQube Scanner |
@@ -417,12 +418,14 @@ GitHub must reach Jenkins from the internet. `http://localhost:8079` exists only
    |---------------|---------------------------------------------------------------|
    | Payload URL   | `https://<name>.ngrok-free.app/github-webhook/` – the final `/github-webhook/` is required |
    | Content type  | `application/json`                                            |
+   | Secret        | the value of `GITHUB_WEBHOOK_SECRET` from your `.env`         |
    | Which events  | **Just the push event**                                       |
    | Active        | ticked                                                        |
 
 **Check:**
 
 1. GitHub → **Webhooks** → your webhook → **Recent Deliveries**: green tick, response **200**.
+   (**400** means the Secret differs from `GITHUB_WEBHOOK_SECRET` – Jenkins ignores requests that GitHub didn't sign.)
 2. Push a small change. A new build starts within seconds; the build page says **Started by GitHub push by …**.
 
 > ngrok makes your Jenkins reachable from the internet. Jenkins requires a login for everything except the webhook
@@ -686,6 +689,7 @@ environment variables, so a `sh 'env'` in a Jenkinsfile can't print them. Builds
 | `GITHUB_BRANCH`          | `casc.yaml` → job            | no     | `master`                                            | Branch the job builds |
 | `GITHUB_USERNAME`        | `casc.yaml` → `github-credentials` | no | empty                                             | Private repository only |
 | `GITHUB_TOKEN`           | secret → `github-credentials`| **yes**| empty                                               | Private repository only (Contents: Read-only) |
+| `GITHUB_WEBHOOK_SECRET`  | secret → `github-webhook-secret` | **yes** | –                                              | Same text as the Secret of the webhook in GitHub |
 | `DOCKERHUB_USERNAME`     | `casc.yaml` → `dockerhub-credentials` | no | `manivannanbgi`                               | Docker Hub user |
 | `DOCKERHUB_TOKEN`        | secret → `dockerhub-credentials` | **yes** | –                                               | Docker Hub access token (Read & Write) |
 | `SONARQUBE_PORT`         | `sonarqube` port             | no     | `9000`                                              | Port of the SonarQube UI on the host |
@@ -842,7 +846,7 @@ running. That is expected: the application container uses the network, so Docker
 | What you change                                   | Where                              | Then run                                          |
 |---------------------------------------------------|------------------------------------|---------------------------------------------------|
 | Port, URL, repository, branch, user names         | `.env`                             | `docker compose up -d`                            |
-| A password or token (`JENKINS_ADMIN_PASSWORD`, `DOCKERHUB_TOKEN`, `SONAR_TOKEN`, `GITHUB_TOKEN`, `SONAR_WEBHOOK_SECRET`) | `.env` | `docker compose up -d --force-recreate jenkins` |
+| A password or token (`JENKINS_ADMIN_PASSWORD`, `DOCKERHUB_TOKEN`, `SONAR_TOKEN`, `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET`, `SONAR_WEBHOOK_SECRET`) | `.env` | `docker compose up -d --force-recreate jenkins` |
 | Jenkins settings, credentials, the job            | `jenkins/casc.yaml`                | `docker compose up -d --build`                    |
 | Plugins                                           | `jenkins/plugins.txt`              | `docker compose up -d --build`                    |
 | The pipeline stages                               | `Jenkinsfile` (project root)       | commit and push – the next build uses it          |
@@ -969,6 +973,7 @@ Engine gets a new major version (`docker version` → Server).
 | Smoke Test fails after all retries                                              | The application doesn't start                                      | `docker logs simple-spring-boot-app` |
 | `denied: requested access to the resource is denied` (push)                     | `DOCKER_IMAGE` isn't under your Docker Hub user, or the token is read-only | Fix `DOCKER_IMAGE` in the Jenkinsfile; **Read & Write** token |
 | GitHub delivery shows **200** but no build starts                               | The job never ran, or the push was to another branch               | Run the job once by hand ([Step 10](#step-10--run-the-pipeline)); push to `GITHUB_BRANCH` |
+| GitHub delivery shows **400**                                                   | The webhook's Secret is empty or differs from `GITHUB_WEBHOOK_SECRET` | Copy the value from `.env` into the webhook's **Secret**, then **Redeliver** |
 | GitHub delivery fails (`failed to connect`, timeout)                            | PC: ngrok not running. EC2: security group closed, or the address changed | `docker compose --profile tunnel up -d` / check the security group and the Elastic IP |
 | ngrok log: the endpoint is already online                                       | Another ngrok (e.g. the old one on Windows) uses your domain       | Stop the other ngrok |
 | Jenkins warning "Building on the built-in node can be a security issue"         | Builds run on the Jenkins container itself                         | Expected in this setup – see [Security notes](#security-notes) |
@@ -990,8 +995,8 @@ Engine gets a new major version (`docker version` → Server).
   container that runs the builds), so the Jenkins controller itself never runs build commands.
 - **Network:** the database has no published port and sits in an internal network; only Jenkins (8079), SonarQube
   (9000) and the application (8080) are published. On EC2, the security group decides who reaches them.
-- **Webhooks:** the SonarQube → Jenkins webhook is signed (`SONAR_WEBHOOK_SECRET`); Jenkins rejects unsigned or forged
-  results.
+- **Webhooks:** both webhooks into Jenkins are signed – GitHub → Jenkins (`GITHUB_WEBHOOK_SECRET`) and SonarQube →
+  Jenkins (`SONAR_WEBHOOK_SECRET`); Jenkins rejects unsigned or forged requests.
 - **HTTPS:** plain HTTP is fine on your PC and through an SSH tunnel. Before Jenkins or SonarQube are used over the
   internet with real accounts, put HTTPS in front of them ([Step E7](#step-e7--before-real-production-use)).
 - **Users:** Jenkins, SonarQube and the application all run as non-root users inside their containers.

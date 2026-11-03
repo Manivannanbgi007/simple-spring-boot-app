@@ -35,6 +35,7 @@ services:
       - jenkins_admin_password
       - dockerhub_token
       - github_token
+      - github_webhook_secret
       - sonar_token
       - sonar_webhook_secret
     group_add:
@@ -158,6 +159,8 @@ secrets:
     environment: DOCKERHUB_TOKEN
   github_token:
     environment: GITHUB_TOKEN
+  github_webhook_secret:
+    environment: GITHUB_WEBHOOK_SECRET
   sonar_token:
     environment: SONAR_TOKEN
   sonar_webhook_secret:
