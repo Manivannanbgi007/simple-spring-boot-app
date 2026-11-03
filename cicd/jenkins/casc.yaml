@@ -89,8 +89,12 @@ jobs:
         properties {
           pipelineTriggers {
             triggers {
-              // "GitHub hook trigger for GITScm polling": a GitHub webhook starts a build on every push
-              githubPush()
+              // "Poll SCM": every ~2 minutes Jenkins asks GitHub for new commits and builds if there are any.
+              // Works on a PC without a public address. For instant builds through a GitHub webhook
+              // (EC2, or a PC with ngrok) use githubPush() instead.
+              pollSCM {
+                scmpoll_spec('H/2 * * * *')
+              }
             }
           }
         }
