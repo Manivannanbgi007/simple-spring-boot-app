@@ -31,7 +31,7 @@ class HelloControllerTest {
     void newHello_returnsOkWithNewMessage() throws Exception {
         mockMvc.perform(get("/api/new"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.message").value("NEW SPRING BOOT APPLICATION!"));
+                .andExpect(jsonPath("$.message").value("NEW SPRING BOOT APPLICATION !!!"));
     }
 
     @Test

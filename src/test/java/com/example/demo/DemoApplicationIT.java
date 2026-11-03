@@ -40,7 +40,7 @@ class DemoApplicationIT {
                 .expectStatus().isOk()
                 .expectHeader().contentType(MediaType.APPLICATION_JSON)
                 .expectBody()
-                .jsonPath("$.message").isEqualTo("NEW SPRING BOOT APPLICATION!");
+                .jsonPath("$.message").isEqualTo("NEW SPRING BOOT APPLICATION !!!");
     }
 
     @Test

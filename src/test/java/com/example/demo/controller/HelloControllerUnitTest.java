@@ -23,6 +23,6 @@ class HelloControllerUnitTest {
     @Test
     void newHello_returnsNewApplicationMessage() {
         assertThat(controller.newHello())
-                .isEqualTo(Map.of("message", "NEW SPRING BOOT APPLICATION!"));
+                .isEqualTo(Map.of("message", "NEW SPRING BOOT APPLICATION !!!"));
     }
 }
