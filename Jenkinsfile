@@ -1,11 +1,12 @@
-// CI/CD pipeline for simple-spring-boot-app (Jenkins on Windows + Docker Desktop).
+// CI/CD pipeline for simple-spring-boot-app.
+// Jenkins runs as a Linux container (cicd/docker-compose.yml) - the same on Windows (Docker Desktop) and Ubuntu.
 //
-// Checkout -> Build -> Unit Tests -> Package JAR -> Docker Build -> Docker Login
-//          -> Docker Push -> Docker Pull -> Deploy -> Smoke Test
+// Checkout -> Build -> Unit Tests -> Integration Tests -> SonarQube Analysis -> Quality Gate
+//          -> Package JAR -> Docker Build -> Docker Login -> Docker Push -> Docker Pull
+//          -> Deploy -> Smoke Test
 //
-// Before the first run: set DOCKER_IMAGE below and create the Jenkins credential
-// 'dockerhub-credentials'. Step-by-step setup: CICD-GUIDE.md
-// (Tamil: JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md)
+// Jenkins itself (credentials 'dockerhub-credentials' and 'sonarqube-token', SonarQube server 'SonarQube',
+// this job) is configured by cicd/jenkins/casc.yaml. Step-by-step setup: cicd/README.md
 pipeline {
     agent any
 
@@ -15,7 +16,9 @@ pipeline {
         // Image tag = Jenkins build number, e.g. v42 (the same number as the JAR name)
         IMAGE_TAG      = "v${env.BUILD_NUMBER}"
         CONTAINER_NAME = 'simple-spring-boot-app'
-        // Port on this machine where the deployed application is available
+        // Docker network created by cicd/docker-compose.yml. Jenkins reaches the deployed container through it.
+        DOCKER_NETWORK = 'cicd-network'
+        // Port on the Docker host where the deployed application is available
         HOST_PORT      = '8080'
     }
 
@@ -35,14 +38,14 @@ pipeline {
 
         stage('Build') {
             steps {
-                // -B (batch mode) keeps the log clean. In 'bat' commands, %NAME% reads a variable.
-                bat '.\\mvnw.cmd -B clean compile'
+                // -B (batch mode) keeps the log clean. In 'sh' commands, $NAME reads a variable.
+                sh './mvnw -B clean compile'
             }
         }
 
         stage('Unit Tests') {
             steps {
-                bat '.\\mvnw.cmd -B test'
+                sh './mvnw -B test'
             }
             post {
                 always {
@@ -52,10 +55,44 @@ pipeline {
             }
         }
 
+        stage('Integration Tests') {
+            steps {
+                // Runs only the integration tests (classes ending in IT, e.g. DemoApplicationIT): starts the
+                // whole application on a random free port and calls it over HTTP. The stages above already
+                // compiled the code, so the unit tests do not run again and no JAR is built here.
+                sh './mvnw -B failsafe:integration-test failsafe:verify'
+            }
+            post {
+                always {
+                    // TEST-*.xml only: failsafe-summary.xml in the same folder is not a JUnit report
+                    junit 'target/failsafe-reports/TEST-*.xml'
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                // Sends the code, test results and coverage (from the stages above) to SonarQube.
+                // 'SonarQube' = server name in cicd/jenkins/casc.yaml (gives the URL + token)
+                withSonarQubeEnv('SonarQube') {
+                    sh './mvnw -B sonar:sonar'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                // Waits for SonarQube's verdict (sent back by its webhook); a failed gate stops the build here
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
         stage('Package JAR') {
             steps {
-                // Creates target\simple-spring-boot-app-v<build number>.jar (tests already ran above)
-                bat '.\\mvnw.cmd -B package -DskipTests -DbuildNumber=%BUILD_NUMBER%'
+                // Creates target/simple-spring-boot-app-v<build number>.jar (tests already ran above)
+                sh './mvnw -B package -DskipTests -DbuildNumber=$BUILD_NUMBER'
                 archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
             }
         }
@@ -63,56 +100,61 @@ pipeline {
         stage('Docker Build') {
             steps {
                 // Builds the image from the Dockerfile, tagged with the version and 'latest'
-                bat 'docker build -t %DOCKER_IMAGE%:%IMAGE_TAG% -t %DOCKER_IMAGE%:latest .'
+                sh 'docker build -t "$DOCKER_IMAGE:$IMAGE_TAG" -t "$DOCKER_IMAGE:latest" .'
             }
         }
 
         stage('Docker Login') {
             steps {
-                // Uses the Docker Hub token stored in Jenkins (credential ID 'dockerhub-credentials')
+                // Uses the Docker Hub token stored in Jenkins (credential ID 'dockerhub-credentials').
+                // Single quotes: the shell reads the token, so it never appears in the Jenkinsfile or the log.
                 withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials',
                                                   usernameVariable: 'DOCKERHUB_USER',
                                                   passwordVariable: 'DOCKERHUB_TOKEN')]) {
-                    // No space before '|' - otherwise Windows adds a space to the end of the token
-                    bat 'echo %DOCKERHUB_TOKEN%| docker login -u %DOCKERHUB_USER% --password-stdin'
+                    sh 'echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin'
                 }
             }
         }
 
         stage('Docker Push') {
             steps {
-                bat 'docker push %DOCKER_IMAGE%:%IMAGE_TAG%'
-                bat 'docker push %DOCKER_IMAGE%:latest'
+                sh 'docker push "$DOCKER_IMAGE:$IMAGE_TAG"'
+                sh 'docker push "$DOCKER_IMAGE:latest"'
             }
         }
 
         stage('Docker Pull') {
             steps {
                 // Delete the local copy first, so the image really comes from Docker Hub
-                bat 'docker rmi %DOCKER_IMAGE%:%IMAGE_TAG% %DOCKER_IMAGE%:latest'
-                bat 'docker pull %DOCKER_IMAGE%:%IMAGE_TAG%'
+                sh 'docker rmi "$DOCKER_IMAGE:$IMAGE_TAG" "$DOCKER_IMAGE:latest"'
+                sh 'docker pull "$DOCKER_IMAGE:$IMAGE_TAG"'
             }
         }
 
         stage('Deploy') {
             steps {
-                // Remove the container of the previous build ("|| exit /b 0" = no error if there is none)
-                bat 'docker rm -f %CONTAINER_NAME% || exit /b 0'
-                bat 'docker run -d --name %CONTAINER_NAME% -p %HOST_PORT%:8080 --restart unless-stopped %DOCKER_IMAGE%:%IMAGE_TAG%'
+                // Remove the container of the previous build ("|| true" = no error if there is none)
+                sh 'docker rm -f "$CONTAINER_NAME" || true'
+                sh 'docker run -d --name "$CONTAINER_NAME" --network "$DOCKER_NETWORK" -p "$HOST_PORT:8080" --restart unless-stopped "$DOCKER_IMAGE:$IMAGE_TAG"'
             }
         }
 
         stage('Smoke Test') {
             steps {
-                // Call the API, retrying for up to ~30 seconds while the application starts
-                bat 'curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-all-errors http://localhost:%HOST_PORT%/api/hello'
+                // Jenkins runs in a container, where 'localhost' is Jenkins itself. It reaches the application
+                // by its container name through DOCKER_NETWORK. Retries for up to ~30 seconds while it starts.
+                sh 'curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-all-errors "http://$CONTAINER_NAME:8080/api/hello"'
             }
         }
     }
 
     post {
+        always {
+            // Remove the Docker Hub login from the Jenkins container (docker login stores it in the jenkins_home volume)
+            sh 'docker logout'
+        }
         success {
-            echo "Deployed ${env.DOCKER_IMAGE}:${env.IMAGE_TAG} - open http://localhost:${env.HOST_PORT}/api/hello"
+            echo "Deployed ${env.DOCKER_IMAGE}:${env.IMAGE_TAG} - open http://localhost:${env.HOST_PORT}/api/hello (on EC2: http://<EC2 address>:${env.HOST_PORT}/api/hello)"
         }
         failure {
             echo 'Build failed. Open "Console Output" and look for the first ERROR in the failed stage.'

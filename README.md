@@ -8,7 +8,7 @@ A minimal Spring Boot application that exposes one REST endpoint:
 GET /api/hello  →  {"message": "Hello! Spring Boot application is running successfully."}
 ```
 
-It is intentionally small: one application class, one controller, one configuration file, and one test.
+It is intentionally small: one application class, one controller, one configuration file, plus unit and integration tests.
 
 ## Technology Stack
 
@@ -18,7 +18,10 @@ It is intentionally small: one application class, one controller, one configurat
 | Spring Boot      | 4.1.2   | Application framework                           |
 | Spring Web (MVC) | (managed by Spring Boot) | REST API support with embedded Tomcat |
 | Maven            | 3.9.16 (via Maven Wrapper) | Dependency management and build |
-| JUnit 5 + MockMvc| (managed by Spring Boot) | Testing the REST endpoint          |
+| JUnit + MockMvc + RestTestClient | (managed by Spring Boot) | Unit and integration tests |
+| JaCoCo           | 0.8.15  | Code coverage of the unit tests                 |
+| SonarQube        | Community Build 26.10 + PostgreSQL 17 (Docker Compose) + Maven scanner 5.8 | Code quality analysis and quality gate |
+| Jenkins          | 2.580.2 LTS (Docker Compose)  | CI/CD pipeline                                  |
 
 ## Prerequisites
 
@@ -35,15 +38,19 @@ It is intentionally small: one application class, one controller, one configurat
 simple-spring-boot-app/
 ├── .mvn/wrapper/maven-wrapper.properties    # Maven Wrapper settings (which Maven version to use)
 ├── .dockerignore                            # Files Docker may read when building the image (only the JAR)
+├── .gitattributes                           # Keeps Unix line endings for files used in Linux containers
 ├── .gitignore                               # Files Git must not commit (target/, IDE files)
-├── CICD-GUIDE.md                            # Step-by-step Jenkins CI/CD setup guide
+├── cicd/                                    # Jenkins + SonarQube as Docker containers (Docker Compose) - see cicd/README.md
+├── CICD-GUIDE.md                            # Previous setup: Jenkins as a Windows service
 ├── Dockerfile                               # Builds the Docker image from the JAR
-├── Jenkinsfile                              # Jenkins CI/CD pipeline: build, test, Docker, deploy
+├── Jenkinsfile                              # Jenkins CI/CD pipeline: build, test, SonarQube, Docker, deploy
 ├── JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md  # Jenkins setup and pipeline guide in Tamil
 ├── mvnw                                     # Maven Wrapper script (macOS / Linux)
 ├── mvnw.cmd                                 # Maven Wrapper script (Windows)
 ├── pom.xml                                  # Maven build file: Java version, dependencies, plugins
 ├── README.md
+├── SONARQUBE-GUIDE.md                       # Previous setup: SonarQube with docker run + Jenkins on Windows
+├── SONARQUBE_GUIDE_TAMIL.md                 # The same SonarQube guide in Tamil
 └── src/
     ├── main/
     │   ├── java/com/example/demo/
@@ -53,23 +60,30 @@ simple-spring-boot-app/
     │   └── resources/
     │       └── application.yml              # Configuration (server port, app name)
     └── test/
-        └── java/com/example/demo/controller/
-            └── HelloControllerTest.java     # Test for GET /api/hello
+        └── java/com/example/demo/
+            ├── DemoApplicationIT.java       # Integration tests: whole app over real HTTP
+            └── controller/
+                ├── HelloControllerUnitTest.java  # Unit tests: controller methods, no Spring
+                └── HelloControllerTest.java      # Unit tests: web layer with MockMvc
 ```
 
 ### What each important file does
 
 - **`pom.xml`** – Inherits from `spring-boot-starter-parent`, which manages all library versions. Declares two dependencies:
   - `spring-boot-starter-webmvc` – Spring MVC + embedded Tomcat server, used to build REST APIs.
-  - `spring-boot-starter-webmvc-test` – JUnit 5, MockMvc, and AssertJ for testing (test scope only).
+  - `spring-boot-starter-webmvc-test` – JUnit 5, MockMvc, RestTestClient, and AssertJ for testing (test scope only).
 
   The `spring-boot-maven-plugin` builds a runnable JAR and provides the `spring-boot:run` command.
+  The `maven-failsafe-plugin` runs the integration tests (`*IT` classes) during `verify`.
+  The `jacoco-maven-plugin` measures the unit tests' code coverage (`target/site/jacoco/`), and the `sonar-maven-plugin` (`sonar:sonar`) sends the analysis to SonarQube under the project key `simple-spring-boot-app`.
   The `buildNumber` property (default `0`) sets the number in the JAR name; Jenkins overrides it (see [Build Version Numbering](#build-version-numbering)).
 - **`DemoApplication.java`** – Contains the `main` method. `@SpringBootApplication` turns on auto-configuration and scans the `com.example.demo` package (and its sub-packages) for components such as controllers.
 - **`HelloController.java`** – `@RestController` marks it as a REST controller whose return values are written directly as the HTTP response body. `@RequestMapping("/api")` + `@GetMapping("/hello")` map the method to `GET /api/hello`. The returned `Map` is converted to JSON automatically.
 - **`application.yml`** – External configuration in YAML format (indentation shows the nesting, so `server:` → `port:` means `server.port`). `server.port` sets the HTTP port, so it can be changed without touching Java code. Use spaces for indentation, never tabs.
-- **`HelloControllerTest.java`** – Uses `@WebMvcTest` to load only the web layer and `MockMvc` to send a fake HTTP request, then checks the status code is `200` and the JSON `message` is correct.
-- **`Jenkinsfile`** – The Jenkins CI/CD pipeline: builds and tests the code, creates the JAR and Docker image, pushes the image to Docker Hub, and deploys it as a container (see [Jenkins CI/CD Pipeline](#jenkins-cicd-pipeline)).
+- **`HelloControllerUnitTest.java`** – Plain unit test: creates the controller with `new` and checks the `Map` each method returns. No Spring, so it runs in milliseconds.
+- **`HelloControllerTest.java`** – Uses `@WebMvcTest` to load only the web layer and `MockMvc` to send fake HTTP requests. Checks that `GET /api/hello` and `GET /api/new` return `200` with the correct JSON `message`, and that `POST` is rejected with `405`.
+- **`DemoApplicationIT.java`** – Integration test: `@SpringBootTest(webEnvironment = RANDOM_PORT)` starts the whole application on a free port, and `RestTestClient` calls it over real HTTP. Checks both API endpoints, `GET /actuator/health` (`UP`), that other actuator endpoints such as `/actuator/env` are not exposed, and that unknown paths return `404`.
+- **`Jenkinsfile`** – The Jenkins CI/CD pipeline: builds and tests the code, checks it with SonarQube, creates the JAR and Docker image, pushes the image to Docker Hub, and deploys it as a container (see [Jenkins CI/CD Pipeline](#jenkins-cicd-pipeline)).
 - **`Dockerfile`** – Builds a Docker image that runs the JAR on a Java 21 runtime as a non-root user. `.dockerignore` makes Docker read only the JAR.
 
 ## Maven Build Commands
@@ -82,11 +96,15 @@ Run all commands from the `simple-spring-boot-app` folder.
 | 2. Compile                   | `.\mvnw.cmd compile`         | `./mvnw compile`           |
 | 3. Run unit tests            | `.\mvnw.cmd test`            | `./mvnw test`              |
 | 4. Package (creates the JAR) | `.\mvnw.cmd clean package`   | `./mvnw clean package`     |
-| 5. Start the application     | `.\mvnw.cmd spring-boot:run` | `./mvnw spring-boot:run`   |
+| 5. Run unit + integration tests | `.\mvnw.cmd clean verify` | `./mvnw clean verify`      |
+| 6. Start the application     | `.\mvnw.cmd spring-boot:run` | `./mvnw spring-boot:run`   |
+| 7. SonarQube analysis        | `.\mvnw.cmd clean verify sonar:sonar` | `./mvnw clean verify sonar:sonar` |
 
 > If Maven is installed globally, you can replace `mvnw` / `mvnw.cmd` with `mvn`.
 
-`package` also runs the tests. A successful build ends with `BUILD SUCCESS` and creates:
+Step 7 needs a running SonarQube and the environment variables `SONAR_HOST_URL` and `SONAR_TOKEN` – see [SONARQUBE-GUIDE.md, Step 4](SONARQUBE-GUIDE.md#step-4--run-the-first-analysis-from-your-pc). After `test`, the coverage report is in `target/site/jacoco/index.html`.
+
+`package` also runs the unit tests (`verify` runs the integration tests too). A successful build ends with `BUILD SUCCESS` and creates:
 
 ```
 target/simple-spring-boot-app-v0.jar
@@ -114,16 +132,18 @@ The JAR name contains a build number, set by the `buildNumber` property in `pom.
 
 ## Jenkins CI/CD Pipeline
 
-On every push to GitHub, the `Jenkinsfile` runs these stages on Jenkins (Windows + Docker Desktop):
+On every push to GitHub, the `Jenkinsfile` runs these stages on Jenkins. Jenkins and SonarQube run as Docker containers
+(`cicd/docker-compose.yml`), the same way on Windows with Docker Desktop and on Ubuntu Linux (for example AWS EC2):
 
 ```text
-Checkout ▶ Build ▶ Unit Tests ▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ▶ Docker Pull ▶ Deploy ▶ Smoke Test
+Checkout ▶ Build ▶ Unit Tests ▶ Integration Tests ▶ SonarQube Analysis ▶ Quality Gate ▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ▶ Docker Pull ▶ Deploy ▶ Smoke Test
 ```
 
-The result is the image `<docker-hub-username>/simple-spring-boot-app:v<build number>` on Docker Hub and a running container at `http://localhost:8080/api/hello`.
+The result is the image `<docker-hub-username>/simple-spring-boot-app:v<build number>` on Docker Hub and a running container at `http://localhost:8080/api/hello`. If the code fails the SonarQube quality gate, the build stops before the Docker stages.
 
-**Setup:** follow [CICD-GUIDE.md](CICD-GUIDE.md) – GitHub, Jenkins, plugins, Docker, Docker Hub, credentials, webhook, verifying each stage, and troubleshooting.
-The same guide in Tamil, with more detail on installing Jenkins and Docker Desktop: [JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md](JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md).
+**Setup:** follow [cicd/README.md](cicd/README.md) – Docker, the Compose services, `.env`, SonarQube, GitHub and Docker Hub authentication, the webhook, verifying each stage, moving to AWS EC2, volumes, backup, and troubleshooting.
+
+The previous setup (Jenkins as a Windows service, SonarQube started with `docker run`) is described in [CICD-GUIDE.md](CICD-GUIDE.md) and [SONARQUBE-GUIDE.md](SONARQUBE-GUIDE.md) (Tamil: [JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md](JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md), [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md)). The current `Jenkinsfile` no longer runs on that setup.
 
 ## Starting the Application
 
@@ -230,16 +250,19 @@ Open `http://localhost:8080/api/hello`. The browser displays the JSON response.
 curl http://localhost:8080/api/hello
 ```
 
-### Automated test
+### Automated tests
+
+| Kind | Classes | Run by | Command (Windows / macOS + Linux) |
+|------|---------|--------|-----------------------------------|
+| Unit tests | names ending in `Test` | Maven Surefire | `.\mvnw.cmd test` / `./mvnw test` |
+| Integration tests | names ending in `IT` | Maven Failsafe | `.\mvnw.cmd clean verify` / `./mvnw clean verify` (runs the unit tests first) |
+
+The integration tests start the application on a random free port, so they also work while something else (for example the deployed container) is using port 8080.
+
+Expected output of `verify` includes:
 
 ```
-.\mvnw.cmd test        # Windows
-./mvnw test            # macOS / Linux
-```
-
-Expected output includes:
-
-```
-Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0      <- unit tests
+Tests run: 8, Failures: 0, Errors: 0, Skipped: 0      <- integration tests
 BUILD SUCCESS
 ```

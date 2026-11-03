@@ -1,0 +1,5 @@
+# Files that run inside Linux containers must keep Unix line endings (LF), also when checked out on Windows.
+# Without this, Git on Windows may convert them to CRLF and the scripts fail with "bad interpreter" or "$'\r'".
+mvnw        text eol=lf
+*.sh        text eol=lf
+cicd/**     text eol=lf

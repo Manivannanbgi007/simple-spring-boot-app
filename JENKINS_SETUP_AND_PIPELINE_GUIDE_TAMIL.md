@@ -9,9 +9,12 @@
 ```text
  git push ──▶ GitHub ──webhook──▶ Jenkins
                                      │
-   Checkout ▶ Build ▶ Unit Tests ▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ──▶ Docker Hub
-                                                                                                 │
-                                        Smoke Test ◀ Deploy (docker run) ◀ Docker Pull ◀─────────┘
+   Checkout ▶ Build ▶ Unit Tests ▶ Integration Tests ▶ SonarQube Analysis ▶ Quality Gate ──┐
+                                                       (SonarQube: localhost:9000)         │ passed
+   ┌───────────────────────────────────────────────────────────────────────────────────────┘
+   └▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ──▶ Docker Hub
+                                                                    │
+               Smoke Test ◀ Deploy (docker run) ◀ Docker Pull ◀─────┘
 ```
 
 > 📌 **திரை வடிவங்கள் பற்றி:** இந்த ஆவணத்தில் உள்ள பெட்டி வடிவப் படங்கள் (┌──┐) உண்மையான screenshots அல்ல. Jenkins, GitHub, Docker Hub திரைகளில் நீங்கள் நிரப்ப வேண்டிய fields-ஐ text வடிவில் காட்டுகின்றன. Menu, button பெயர்கள் திரையில் உள்ளபடியே ஆங்கிலத்தில் **bold** எழுத்தில் கொடுக்கப்பட்டுள்ளன — திரையில் அதே பெயரைத் தேடுங்கள்.
@@ -48,6 +51,7 @@
 | GitHub கணக்கு | Source code சேமிக்க | https://github.com/signup |
 | Docker Hub கணக்கு | Docker image சேமிக்க | https://hub.docker.com/ |
 | ngrok (விருப்பம்) | GitHub webhook உங்கள் கணினியை அடைய | https://ngrok.com/download |
+| SonarQube (Docker-ல்) | Code தரச் சோதனை, quality gate | [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md) |
 
 > **Maven-ஐ தனியாக நிறுவ வேண்டியதில்லை.** Project-ல் உள்ள Maven Wrapper (`mvnw.cmd`) சரியான Maven version-ஐ (3.9.16) தானாக download செய்யும் (பிரிவு 4).
 
@@ -61,6 +65,8 @@
 | Jenkins install folder | `C:\Program Files\Jenkins` | இந்தக் கணினியில்: `D:\Jenkins` |
 | Jenkins job பெயர் | `simple-spring-boot-app` | |
 | Docker Hub credential ID | `dockerhub-credentials` | Jenkinsfile இந்த ID-ஐப் பயன்படுத்துகிறது |
+| SonarQube முகவரி | `http://localhost:9000` | Docker container `sonarqube` |
+| SonarQube credential ID | `sonarqube-token` | Jenkins → System → SonarQube servers-ல் பயன்படுகிறது |
 | GitHub credential ID | `github-credentials` | Private repository-க்கு மட்டும் |
 | `<github-username>` | உங்கள் GitHub username | **நீங்கள் மாற்ற வேண்டும்** |
 | `<docker-hub-username>` | உங்கள் Docker Hub username (சிறிய எழுத்துகள்) | **நீங்கள் மாற்ற வேண்டும்** |
@@ -255,8 +261,9 @@ Plugin என்பது Jenkins-க்குப் புதிய திற�
 | **Git** | GitHub repository-லிருந்து code checkout | Checkout stage | பிரிவு [3.2](#section-3-2) (Tools → Git) |
 | **GitHub** | GitHub webhook-ஐ ஏற்று build தொடங்க | Triggers | பிரிவு [7.6](#section-7-6) |
 | **Credentials** மற்றும் **Credentials Binding** | Token / password-ஐ பாதுகாப்பாகச் சேமித்து `withCredentials` மூலம் பயன்படுத்த | Docker Login stage | பிரிவு [6.4](#section-6-4) |
-| **JUnit** | Unit test முடிவுகளை build page-ல் காட்ட | Unit Tests stage | தேவையில்லை |
+| **JUnit** | Unit test, integration test முடிவுகளை build page-ல் காட்ட | Unit Tests, Integration Tests stages | தேவையில்லை |
 | **Pipeline Graph View** (அல்லது பழைய **Pipeline: Stage View**) | Stages-ஐ படமாகக் காட்ட | Job page, Build page | பிரிவு [2.4](#section-2-4) (Appearance) |
+| **SonarQube Scanner** | `withSonarQubeEnv`, `waitForQualityGate` — **suggested plugins-ல் இல்லை**, தனியாக நிறுவ வேண்டும் | SonarQube Analysis, Quality Gate stages | [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md) பிரிவுகள் 5, 7 |
 
 **Maven, Docker, Docker Hub-க்குத் தனி plugin தேவையா?**
 
@@ -581,21 +588,24 @@ pipeline {
 **எதிர்பார்க்கும் output:**
 
 ```text
-[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
 [INFO] Building jar: D:\...\simple-spring-boot-app\target\simple-spring-boot-app-v0.jar
 [INFO] BUILD SUCCESS
 ```
 
-**Jenkins-ல்** pipeline இதை மூன்று stages-ஆகப் பிரிக்கிறது — எந்தப் படியில் தோல்வி என்பது தெளிவாகத் தெரியும்:
+`package` unit tests-ஐ மட்டும் இயக்கும்; integration tests-க்கு `verify` தேவை ([4.5](#section-4-5)).
+
+**Jenkins-ல்** pipeline இதை நான்கு stages-ஆகப் பிரிக்கிறது — எந்தப் படியில் தோல்வி என்பது தெளிவாகத் தெரியும்:
 
 | Stage | Command | விளைவு |
 |-------|---------|--------|
 | Build | `.\mvnw.cmd -B clean compile` | பழைய `target` நீக்கப்பட்டு code compile ஆகிறது |
-| Unit Tests | `.\mvnw.cmd -B test` | Tests இயங்குகின்றன |
+| Unit Tests | `.\mvnw.cmd -B test` | Unit tests இயங்குகின்றன |
+| Integration Tests | `.\mvnw.cmd -B failsafe:integration-test failsafe:verify` | Integration tests மட்டும் இயங்குகின்றன (முழு application ஒரு random port-ல்) |
 | Package JAR | `.\mvnw.cmd -B package -DskipTests -DbuildNumber=%BUILD_NUMBER%` | `target\simple-spring-boot-app-v<N>.jar` உருவாகிறது |
 
 - `-B` = batch mode — log சுத்தமாக இருக்கும்.
-- `-DskipTests` = Unit Tests stage-ல் ஏற்கனவே tests ஓடியதால் மீண்டும் இயக்க வேண்டாம்.
+- `-DskipTests` = Unit Tests, Integration Tests stages-ல் ஏற்கனவே tests ஓடியதால் மீண்டும் இயக்க வேண்டாம்.
 - `-DbuildNumber=%BUILD_NUMBER%` = Jenkins build எண் JAR பெயரில் வரும் (build #42 → `simple-spring-boot-app-v42.jar`). Developer கணினியில் இது `v0`.
 - **Executable JAR:** `pom.xml`-ல் உள்ள `spring-boot-maven-plugin`, application + அனைத்து dependencies + Tomcat server-ஐ ஒரே JAR-ல் சேர்க்கிறது. அதனால் `java -jar` மூலம் நேரடியாக இயக்கலாம்:
 
@@ -605,9 +615,23 @@ pipeline {
 
 - Jenkins இந்த JAR-ஐ **archive** செய்கிறது → build page → **Build Artifacts**-ல் download செய்யலாம்.
 
-### 4.5 Unit tests இயக்கி முடிவுகளைச் சரிபார்த்தல்
+<a id="section-4-5"></a>
+### 4.5 Unit tests, integration tests இயக்கி முடிவுகளைச் சரிபார்த்தல்
 
-**உங்கள் கணினியில்:**
+Project-ல் இரண்டு வகை tests உள்ளன:
+
+| Test class | வகை | என்ன சோதிக்கிறது |
+|------------|-----|-------------------|
+| `HelloControllerUnitTest` | Unit test (Spring இல்லை) | Controller-ஐ `new` மூலம் உருவாக்கி, ஒவ்வொரு method தரும் `Map`-ஐ நேரடியாகச் சரிபார்க்கிறது |
+| `HelloControllerTest` | Unit test (web layer: `@WebMvcTest` + `MockMvc`) | `GET /api/hello`, `GET /api/new` → `200` + சரியான JSON `message`; `POST /api/hello` → `405` |
+| `DemoApplicationIT` | Integration test (`@SpringBootTest` + `RestTestClient`) | முழு application-ஐ ஒரு random port-ல் தொடங்கி, உண்மையான HTTP மூலம் அழைக்கிறது: இரண்டு API endpoints; `/actuator/health` → `UP`; மற்ற actuator endpoints (`/actuator/env` போன்றவை) வெளியே திறக்கப்படவில்லை (`404`); தெரியாத path → `404` |
+
+Class பெயரின் கடைசிப் பகுதியை வைத்து Maven எந்த plugin மூலம் இயக்குவது என்று முடிவு செய்கிறது:
+
+- `…Test` → **Maven Surefire** → `.\mvnw.cmd test` (unit tests)
+- `…IT` → **Maven Failsafe** (`pom.xml`-ல் உள்ள `maven-failsafe-plugin`) → `.\mvnw.cmd verify` (integration tests)
+
+**உங்கள் கணினியில் — unit tests:**
 
 ```powershell
 .\mvnw.cmd test
@@ -617,18 +641,41 @@ pipeline {
 
 ```text
 [INFO] Running com.example.demo.controller.HelloControllerTest
-[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.9 s -- in com.example.demo.controller.HelloControllerTest
-[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.1 s -- in com.example.demo.controller.HelloControllerTest
+[INFO] Running com.example.demo.controller.HelloControllerUnitTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.demo.controller.HelloControllerUnitTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
 [INFO] BUILD SUCCESS
 ```
 
+**உங்கள் கணினியில் — unit tests + integration tests:**
+
+```powershell
+.\mvnw.cmd clean verify
+```
+
+**எதிர்பார்க்கும் output (முக்கிய வரிகள்):**
+
+```text
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0
+[INFO] Building jar: D:\...\simple-spring-boot-app\target\simple-spring-boot-app-v0.jar
+[INFO] --- failsafe:3.5.6:integration-test (default) @ simple-spring-boot-app ---
+[INFO] Running com.example.demo.DemoApplicationIT
+... Tomcat started on port 54432 (http) with context path '/'
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.1 s -- in com.example.demo.DemoApplicationIT
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Integration tests ஒவ்வொரு முறையும் application-ஐ ஒரு **random port**-ல் (மேலே `54432`) தொடங்குகின்றன. அதனால் 8080 port-ல் container ஓடிக்கொண்டிருந்தாலும் பிரச்சினை இல்லை.
+
 > Mockito அல்லது "A Java agent has been loaded dynamically" என்ற `WARNING` வரிகள் Java 21-ல் சாதாரணம் — பிரச்சினை இல்லை.
 
-Test அறிக்கைகள் `target\surefire-reports\` folder-ல் XML files-ஆக உருவாகின்றன.
+Test அறிக்கைகள் XML files-ஆக உருவாகின்றன: unit tests → `target\surefire-reports\`, integration tests → `target\failsafe-reports\`.
 
-**Jenkins-ல்:** Unit Tests stage-ல் உள்ள `junit 'target/surefire-reports/*.xml'` அந்த XML files-ஐப் படித்து:
+**Jenkins-ல்:** Unit Tests stage-ல் உள்ள `junit 'target/surefire-reports/*.xml'`, Integration Tests stage-ல் உள்ள `junit 'target/failsafe-reports/TEST-*.xml'` இரண்டும் அந்த XML files-ஐப் படித்து:
 
-- Build page → **Test Result**: எத்தனை tests ஓடின, எது தோல்வி, ஏன்.
+- Build page → **Test Result**: எத்தனை tests ஓடின (மொத்தம் 13), எது தோல்வி, ஏன்.
 - Job page → **Test Result Trend** வரைபடம் (2 builds-க்குப் பிறகு தெரியும்).
 
 <a id="section-4-6"></a>
@@ -648,13 +695,14 @@ Test அறிக்கைகள் `target\surefire-reports\` folder-ல் XML
 3. **Unit Tests** stage சிவப்பாகும். Console Output-ல்:
 
    ```text
-   [ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 1.904 s <<< FAILURE! -- in com.example.demo.controller.HelloControllerTest
+   [ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 1.904 s <<< FAILURE! -- in com.example.demo.controller.HelloControllerTest
    [ERROR] Failures:
-   [ERROR]   HelloControllerTest.sayHello_returnsOkWithSuccessMessage:26 JSON path "$.message" expected:<Hello! Spring Boot application is running successfully!> but was:<Hello! Spring Boot application is running successfully.>
+   [ERROR]   HelloControllerTest.sayHello_returnsOkWithSuccessMessage:27 JSON path "$.message" expected:<Hello! Spring Boot application is running successfully!> but was:<Hello! Spring Boot application is running successfully.>
+   [ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0
    [INFO] BUILD FAILURE
    ```
 
-   பொருள்: test file-ன் 26-வது வரியில், எதிர்பார்த்தது `…successfully!`, ஆனால் application தந்தது `…successfully.`.
+   பொருள்: test file-ன் 27-வது வரியில், எதிர்பார்த்தது `…successfully!`, ஆனால் application தந்தது `…successfully.`. அடுத்த stages (Integration Tests முதல்) இயங்காது.
 
 4. Build page → **Test Result**-லும் இதே விவரம் தெரியும்.
 5. மாற்றத்தைத் திருப்பி (revert) push செய்யுங்கள் → build மீண்டும் பச்சை ✅.
@@ -1085,20 +1133,25 @@ docker run -d --name simple-spring-boot-app -p 8080:8080 <docker-hub-username>/s
 <a id="section-7"></a>
 ## 7. Jenkins Pipeline செயல்படுத்துதல்
 
-### 7.1 Pipeline-ன் 10 stages
+### 7.1 Pipeline-ன் 13 stages
 
 | # | Stage (Jenkinsfile-ல் பெயர்) | என்ன செய்கிறது |
 |---|------------------------------|----------------|
 | 1 | **Checkout** | GitHub-லிருந்து source code-ஐ எடுக்கிறது |
 | 2 | **Build** | Maven மூலம் Spring Boot application-ஐ compile செய்கிறது |
 | 3 | **Unit Tests** | Unit tests இயக்கி முடிவுகளைப் பதிவு செய்கிறது |
-| 4 | **Package JAR** | Executable JAR-ஐ உருவாக்கி archive செய்கிறது |
-| 5 | **Docker Build** | JAR-லிருந்து Docker image உருவாக்குகிறது |
-| 6 | **Docker Login** | Docker Hub-ல் authenticate செய்கிறது |
-| 7 | **Docker Push** | Image-ஐ Docker Hub-க்கு push செய்கிறது |
-| 8 | **Docker Pull** | Image-ஐ Docker Hub-லிருந்து pull செய்கிறது |
-| 9 | **Deploy** | Image-ஐ container-ஆக இயக்குகிறது |
-| 10 | **Smoke Test** | Application வெற்றிகரமாக இயங்குகிறதா என்று சரிபார்க்கிறது |
+| 4 | **Integration Tests** | முழு application-ஐ random port-ல் தொடங்கி, HTTP மூலம் integration tests இயக்கி முடிவுகளைப் பதிவு செய்கிறது |
+| 5 | **SonarQube Analysis** | Code, test முடிவுகள், coverage-ஐ SonarQube-க்கு அனுப்புகிறது |
+| 6 | **Quality Gate** | SonarQube-ன் முடிவுக்காகக் காத்திருக்கிறது; quality gate தோல்வியானால் build-ஐ நிறுத்துகிறது |
+| 7 | **Package JAR** | Executable JAR-ஐ உருவாக்கி archive செய்கிறது |
+| 8 | **Docker Build** | JAR-லிருந்து Docker image உருவாக்குகிறது |
+| 9 | **Docker Login** | Docker Hub-ல் authenticate செய்கிறது |
+| 10 | **Docker Push** | Image-ஐ Docker Hub-க்கு push செய்கிறது |
+| 11 | **Docker Pull** | Image-ஐ Docker Hub-லிருந்து pull செய்கிறது |
+| 12 | **Deploy** | Image-ஐ container-ஆக இயக்குகிறது |
+| 13 | **Smoke Test** | Application வெற்றிகரமாக இயங்குகிறதா என்று சரிபார்க்கிறது |
+
+Stages 5, 6-க்கு உங்கள் கணினியில் SonarQube இயங்க வேண்டும் — நிறுவி இணைக்க: [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md).
 
 ### 7.2 தொடங்கும் முன் சரிபார்ப்புப் பட்டியல் (Checklist)
 
@@ -1108,6 +1161,7 @@ docker run -d --name simple-spring-boot-app -p 8080:8080 <docker-hub-username>/s
 - [ ] `dockerhub-credentials` சேமிக்கப்பட்டுள்ளது ([6.4](#section-6-4)); private repository என்றால் `github-credentials`-ம் ([3.4](#section-3-4))
 - [ ] Docker Desktop இயங்குகிறது ([5.1](#section-5))
 - [ ] Port 8080 காலியாக உள்ளது — `netstat -ano | findstr :8080` எதையும் காட்டக் கூடாது
+- [ ] SonarQube இயங்குகிறது (`docker ps --filter name=sonarqube` → **Up**); SonarQube Scanner plugin, `sonarqube-token`, `SonarQube` server, webhook அமைக்கப்பட்டுள்ளன ([SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md) பிரிவுகள் 1–8)
 
 <a id="section-7-3"></a>
 ### 7.3 Pipeline job உருவாக்குதல்
@@ -1133,12 +1187,15 @@ docker run -d --name simple-spring-boot-app -p 8080:8080 <docker-hub-username>/s
 ```groovy
 // CI/CD pipeline for simple-spring-boot-app (Jenkins on Windows + Docker Desktop).
 //
-// Checkout -> Build -> Unit Tests -> Package JAR -> Docker Build -> Docker Login
-//          -> Docker Push -> Docker Pull -> Deploy -> Smoke Test
+// Checkout -> Build -> Unit Tests -> Integration Tests -> SonarQube Analysis -> Quality Gate
+//          -> Package JAR -> Docker Build -> Docker Login -> Docker Push -> Docker Pull
+//          -> Deploy -> Smoke Test
 //
 // Before the first run: set DOCKER_IMAGE below and create the Jenkins credential
 // 'dockerhub-credentials'. Step-by-step setup: CICD-GUIDE.md
 // (Tamil: JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md)
+// SonarQube setup (server 'SonarQube' in Manage Jenkins -> System): SONARQUBE-GUIDE.md
+// (Tamil: SONARQUBE_GUIDE_TAMIL.md)
 pipeline {
     agent any
 
@@ -1181,6 +1238,40 @@ pipeline {
                 always {
                     // Show the test results on the build page (also when tests fail)
                     junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                // Runs only the integration tests (classes ending in IT, e.g. DemoApplicationIT): starts the
+                // whole application on a random free port and calls it over HTTP. The stages above already
+                // compiled the code, so the unit tests do not run again and no JAR is built here.
+                bat '.\\mvnw.cmd -B failsafe:integration-test failsafe:verify'
+            }
+            post {
+                always {
+                    // TEST-*.xml only: failsafe-summary.xml in the same folder is not a JUnit report
+                    junit 'target/failsafe-reports/TEST-*.xml'
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                // Sends the code, test results and coverage (from the stages above) to SonarQube.
+                // 'SonarQube' = server name in Manage Jenkins -> System -> SonarQube servers (gives URL + token)
+                withSonarQubeEnv('SonarQube') {
+                    bat '.\\mvnw.cmd -B sonar:sonar'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                // Waits for SonarQube's verdict (sent back by its webhook); a failed gate stops the build here
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
@@ -1313,10 +1404,51 @@ post { always { junit 'target/surefire-reports/*.xml' } }
 ```
 
 - **என்ன செய்கிறது:** Unit tests-ஐ இயக்குகிறது. `post { always { … } }` = tests தோல்வியடைந்தாலும் முடிவுகள் Jenkins-ல் பதிவாகும்.
-- **வெற்றி:** `Tests run: 1, Failures: 0, Errors: 0, Skipped: 0`; build page → **Test Result**.
+- **வெற்றி:** `Tests run: 5, Failures: 0, Errors: 0, Skipped: 0`; build page → **Test Result**.
 - **தோல்வியானால்:** [4.6](#section-4-6).
 
-#### Stage 4 – Package JAR
+#### Stage 4 – Integration Tests
+
+```groovy
+bat '.\\mvnw.cmd -B failsafe:integration-test failsafe:verify'
+...
+post { always { junit 'target/failsafe-reports/TEST-*.xml' } }
+```
+
+- **என்ன செய்கிறது:** `IT`-ல் முடியும் test classes-ஐ (`DemoApplicationIT`) மட்டும் இயக்குகிறது. முழு application ஒரு random port-ல் தொடங்கி, உண்மையான HTTP requests மூலம் சோதிக்கப்படுகிறது (விவரம்: [4.5](#section-4-5)). Random port என்பதால், முந்தைய build-ன் container 8080-ல் ஓடிக்கொண்டிருந்தாலும் பிரச்சினை இல்லை.
+- **`failsafe:integration-test`** = integration tests-ஐ இயக்கு; **`failsafe:verify`** = ஏதாவது ஒன்று தோல்வியடைந்தால் stage-ஐத் தோல்வியாக்கு.
+- **ஏன் `mvnw verify` இல்லை?** முந்தைய stages ஏற்கனவே code-ஐ compile செய்து unit tests-ஐயும் இயக்கிவிட்டன. இந்த இரண்டு goals-ஐ மட்டும் இயக்குவதால் unit tests இரண்டாவது முறை ஓடாது, இங்கே JAR-ம் உருவாகாது (`target`-ல் இரண்டு JARs இருந்தால் Docker Build தோல்வியடையும் — [8.5](#section-8-5)).
+- **ஏன் `TEST-*.xml`?** அதே folder-ல் உள்ள `failsafe-summary.xml` ஒரு test report அல்ல; அதனால் `TEST-*.xml` files மட்டும் படிக்கப்படுகின்றன.
+- **வெற்றி:** `Tests run: 8, Failures: 0, Errors: 0, Skipped: 0`; build page → **Test Result**-ல் `DemoApplicationIT`-ம் தெரியும் (மொத்தம் 13 tests).
+- **தோல்வியானால்:** [8.4](#section-8-4).
+
+#### Stage 5 – SonarQube Analysis
+
+```groovy
+withSonarQubeEnv('SonarQube') {
+    bat '.\\mvnw.cmd -B sonar:sonar'
+}
+```
+
+- **என்ன செய்கிறது:** முந்தைய stages `target`-ல் விட்டவற்றை (compiled classes, test reports, JaCoCo coverage `jacoco.xml`) SonarQube-க்கு அனுப்புகிறது — மீண்டும் compile / test செய்வதில்லை.
+- **`withSonarQubeEnv('SonarQube')`** = Jenkins-ல் அமைத்த `SonarQube` server-ன் URL, token-ஐ scanner-க்குத் தருகிறது. Token Jenkinsfile-லோ log-லோ தெரியாது.
+- **வெற்றி:** `ANALYSIS SUCCESSFUL, you can find the results at: http://localhost:9000/dashboard?id=simple-spring-boot-app`
+- **அமைப்பு / தோல்வியானால்:** [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md) (பிரிவுகள் 5–7, 13).
+
+#### Stage 6 – Quality Gate
+
+```groovy
+timeout(time: 5, unit: 'MINUTES') {
+    waitForQualityGate abortPipeline: true
+}
+```
+
+- **என்ன செய்கிறது:** SonarQube analysis-ஐச் செயலாக்கி webhook மூலம் முடிவை அனுப்பும் வரை காத்திருக்கிறது. `abortPipeline: true` = quality gate தோல்வியானால் build **FAILURE**; Package JAR, Docker, Deploy இயங்காது — ஓடும் container மாறாது.
+- **`timeout`** = webhook 5 நிமிடத்தில் வரவில்லை என்றால் காத்திருப்பை நிறுத்தும்.
+- **வெற்றி:** `SonarQube task '…' completed. Quality gate is 'OK'`; build page-ல் **SonarQube Quality Gate** badge.
+- **தோல்வியானால்:** `ERROR: Pipeline aborted due to quality gate failure: ERROR` → SonarQube dashboard-ல் தோல்வியடைந்த conditions-ஐப் பாருங்கள். Webhook பிரச்சினைகளுக்கு: [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md) பிரிவுகள் 8, 13.
+
+#### Stage 7 – Package JAR
 
 ```groovy
 bat '.\\mvnw.cmd -B package -DskipTests -DbuildNumber=%BUILD_NUMBER%'
@@ -1326,7 +1458,7 @@ archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
 - **என்ன செய்கிறது:** `target\simple-spring-boot-app-v<N>.jar` என்ற executable JAR-ஐ உருவாக்குகிறது. `archiveArtifacts` → JAR-ஐ build உடன் சேமிக்கிறது (**Build Artifacts**). `fingerprint: true` → எந்த build இந்த JAR-ஐ உருவாக்கியது என்று Jenkins கண்காணிக்கும்.
 - **வெற்றி:** `Building jar: …\target\simple-spring-boot-app-v42.jar`
 
-#### Stage 5 – Docker Build
+#### Stage 8 – Docker Build
 
 ```groovy
 bat 'docker build -t %DOCKER_IMAGE%:%IMAGE_TAG% -t %DOCKER_IMAGE%:latest .'
@@ -1335,7 +1467,7 @@ bat 'docker build -t %DOCKER_IMAGE%:%IMAGE_TAG% -t %DOCKER_IMAGE%:latest .'
 - **என்ன செய்கிறது:** `Dockerfile` மூலம் JAR-லிருந்து image உருவாக்கி, `v<N>`, `latest` என்ற இரண்டு tags வழங்குகிறது (விவரம்: [5.6](#section-5)).
 - **வெற்றி:** `naming to docker.io/<docker-hub-username>/simple-spring-boot-app:v42 done`
 
-#### Stage 6 – Docker Login
+#### Stage 9 – Docker Login
 
 ```groovy
 withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', ...)]) {
@@ -1346,7 +1478,7 @@ withCredentials([usernamePassword(credentialsId: 'dockerhub-credentials', ...)])
 - **என்ன செய்கிறது:** Jenkins-ல் சேமித்த token மூலம் Docker Hub-ல் login செய்கிறது (விவரம்: [6.5](#section-6)).
 - **வெற்றி:** `Login Succeeded`. Log-ல் username, token இரண்டும் `****` என்று மறைக்கப்படும்.
 
-#### Stage 7 – Docker Push
+#### Stage 10 – Docker Push
 
 ```groovy
 bat 'docker push %DOCKER_IMAGE%:%IMAGE_TAG%'
@@ -1356,7 +1488,7 @@ bat 'docker push %DOCKER_IMAGE%:latest'
 - **என்ன செய்கிறது:** இரண்டு tags-ஐயும் Docker Hub-க்கு upload செய்கிறது.
 - **வெற்றி:** `v42: digest: sha256:…` மற்றும் `latest: digest: sha256:…`; Docker Hub-ன் **Tags** பக்கத்தில் தெரியும்.
 
-#### Stage 8 – Docker Pull
+#### Stage 11 – Docker Pull
 
 ```groovy
 bat 'docker rmi %DOCKER_IMAGE%:%IMAGE_TAG% %DOCKER_IMAGE%:latest'
@@ -1366,7 +1498,7 @@ bat 'docker pull %DOCKER_IMAGE%:%IMAGE_TAG%'
 - **என்ன செய்கிறது:** Local copy-ஐ நீக்கி, Docker Hub-லிருந்து அதே version-ஐ மீண்டும் download செய்கிறது — Docker Hub-ல் உள்ள image சரியாக உள்ளது என்பதை நிரூபிக்கிறது.
 - **வெற்றி:** `Status: Downloaded newer image for <docker-hub-username>/simple-spring-boot-app:v42`
 
-#### Stage 9 – Deploy (Container-ஆக இயக்குதல்)
+#### Stage 12 – Deploy (Container-ஆக இயக்குதல்)
 
 ```groovy
 bat 'docker rm -f %CONTAINER_NAME% || exit /b 0'
@@ -1385,7 +1517,7 @@ bat 'docker run -d --name %CONTAINER_NAME% -p %HOST_PORT%:8080 --restart unless-
 
 - **வெற்றி:** 64 எழுத்துகள் கொண்ட container ID; `docker ps` → `Up`, `0.0.0.0:8080->8080/tcp`.
 
-#### Stage 10 – Smoke Test (Application சரிபார்ப்பு)
+#### Stage 13 – Smoke Test (Application சரிபார்ப்பு)
 
 ```groovy
 bat 'curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-all-errors http://localhost:%HOST_PORT%/api/hello'
@@ -1478,7 +1610,7 @@ H/2 * * * *
 
 ### 7.7 முடிவைச் சரிபார்த்தல்
 
-1. Build page → **Pipeline Overview** (அல்லது **Stage View**) → **10 stages** அனைத்தும் பச்சை ✅.
+1. Build page → **Pipeline Overview** (அல்லது **Stage View**) → **13 stages** அனைத்தும் பச்சை ✅.
 2. Browser: http://localhost:8080/api/hello →
 
    ```json
@@ -1500,7 +1632,7 @@ H/2 * * * *
    ```
 
 4. Docker Hub → **Repositories** → `simple-spring-boot-app` → **Tags** → `v42`, `latest`.
-5. Jenkins build page → **Test Result**, **Build Artifacts** (JAR).
+5. Jenkins build page → **Test Result** (13 tests: unit 5 + integration 8), **Build Artifacts** (JAR).
 
 ---
 
@@ -1513,6 +1645,7 @@ H/2 * * * *
 2. **Console Output** — **Ctrl + F** → `ERROR` அல்லது `FAILURE` → **முதல்** பிழை தான் பெரும்பாலும் உண்மையான காரணம்.
 3. **Test Result** — எந்த test, ஏன் தோல்வி.
 4. **`docker logs simple-spring-boot-app`** — container-க்குள் application ஏன் பதில் தரவில்லை.
+   SonarQube Analysis / Quality Gate stage சிவப்பு என்றால்: [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md) பிரிவு 13.
 5. **Manage Jenkins → System Log** — Jenkins-ன் சொந்தப் பிழைகள்.
 6. **Event Viewer → Windows Logs → System** — Jenkins *service* ஏன் தொடங்கவில்லை. Service-ன் log files (`*.log`) Jenkins install folder-ல் இருக்கும் (இந்தக் கணினியில் `D:\Jenkins`).
 
@@ -1638,9 +1771,17 @@ H/2 * * * *
 - **காரணம்:** `JAVA_HOME` பழைய JDK-ஐ (உ.தா. 8 அல்லது 17) காட்டுகிறது.
 - **தீர்வு:** `JAVA_HOME`-ஐ JDK 21-க்கு மாற்றி Jenkins-ஐ restart செய்யுங்கள். `tools-check` ([5.4](#section-5-4)) மூலம் சரிபார்க்கவும்.
 
-#### ❌ `Tests run: 1, Failures: 1` (Unit Tests stage சிவப்பு)
-- **காரணம்:** ஒரு test தோல்வியடைந்தது.
+#### ❌ `Tests run: 5, Failures: 1` (Unit Tests stage சிவப்பு)
+- **காரணம்:** ஒரு unit test தோல்வியடைந்தது.
 - **தீர்வு:** [4.6](#section-4-6)-ல் உள்ளபடி **Test Result** பார்த்து code-ஐ (அல்லது test-ஐ) சரிசெய்து push செய்யுங்கள்.
+
+#### ❌ `Tests run: 8, Failures: 1` (Integration Tests stage சிவப்பு)
+- **காரணம்:** ஒரு integration test தோல்வியடைந்தது — ஒரு endpoint தவறான பதில் தருகிறது, அல்லது application தொடங்கவே இல்லை (அப்போது log-ல் `Failed to load ApplicationContext` தெரியும்).
+- **தீர்வு:** **Test Result** → `DemoApplicationIT` → எந்த test, ஏன். உங்கள் கணினியில் `.\mvnw.cmd clean verify` மூலம் அதே பிழையைப் பார்த்துச் சரிசெய்து push செய்யுங்கள்.
+
+#### ❌ `No test report files were found. Configuration error?` (Integration Tests stage)
+- **காரணம்:** `IT`-ல் முடியும் test class எதுவும் இல்லை, அதனால் எந்த integration test-ம் ஓடவில்லை.
+- **தீர்வு:** Integration test class பெயர் `IT`-ல் முடிய வேண்டும் (உ.தா. `DemoApplicationIT`), அது `src\test\java`-ல் இருக்க வேண்டும்.
 
 #### ❌ `COMPILATION ERROR` … `[25,13] cannot find symbol`
 - **காரணம்:** Java code-ல் பிழை.
@@ -1807,8 +1948,12 @@ H/2 * * * *
 | Java version | `java -version` |
 | Git version | `git --version` |
 | Maven (wrapper) version | `.\mvnw.cmd -v` |
-| Build + tests + JAR | `.\mvnw.cmd clean package` |
-| Tests மட்டும் | `.\mvnw.cmd test` |
+| Build + unit tests + JAR | `.\mvnw.cmd clean package` |
+| Unit tests மட்டும் | `.\mvnw.cmd test` |
+| Unit + integration tests | `.\mvnw.cmd clean verify` |
+| SonarQube analysis (`SONAR_HOST_URL`, `SONAR_TOKEN` அமைத்த பின்) | `.\mvnw.cmd clean verify sonar:sonar` |
+| SonarQube நிலை | `curl.exe http://localhost:9000/api/system/status` |
+| SonarQube தொடங்க / நிறுத்த | `docker start sonarqube` / `docker stop sonarqube` |
 | JAR-ஐ இயக்க | `java -jar target\simple-spring-boot-app-v0.jar` |
 | Docker நிலை | `docker version` |
 | Image உருவாக்க | `docker build -t simple-spring-boot-app:local .` |

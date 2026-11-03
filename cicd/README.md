@@ -1,0 +1,999 @@
+# CI/CD with Docker Compose – Jenkins + SonarQube
+
+This folder runs the complete CI/CD environment for `simple-spring-boot-app` as Docker containers:
+**Jenkins**, **SonarQube** and SonarQube's **PostgreSQL** database. Nothing is installed on the machine except Docker,
+and the same files work on **Windows with Docker Desktop** and on **Ubuntu Linux** (for example an AWS EC2 instance).
+
+On every push to GitHub, Jenkins builds and tests the application, checks it with SonarQube, packages the JAR,
+builds a Docker image, pushes it to Docker Hub and deploys it – the same 13 stages as before.
+
+---
+
+## Contents
+
+- [The short answer](#the-short-answer)
+- [What runs where](#what-runs-where)
+- [Folder structure](#folder-structure)
+- [What replaced the manual Windows setup](#what-replaced-the-manual-windows-setup)
+- [Part 1 – Set up on Windows (Docker Desktop)](#part-1--set-up-on-windows-docker-desktop) – Steps 1–13
+- [Part 2 – Move to Ubuntu on AWS EC2](#part-2--move-to-ubuntu-on-aws-ec2) – Steps E1–E7
+- [The files explained](#the-files-explained)
+- [Persistent data (volumes)](#persistent-data-volumes)
+- [Everyday commands](#everyday-commands)
+- [Changing settings and rotating tokens](#changing-settings-and-rotating-tokens)
+- [Backup and restore](#backup-and-restore)
+- [Upgrading](#upgrading)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+
+---
+
+## The short answer
+
+> *"Can we install Docker and Docker Compose on an Ubuntu EC2 instance, copy the Compose configuration and start
+> everything with Docker Compose?"*
+
+**Yes.** That is exactly how this setup is built. On a new machine you:
+
+1. install Docker (Docker Desktop on Windows, Docker Engine + the Compose plugin on Ubuntu),
+2. get this folder (`git clone` the repository),
+3. create the `.env` file with that machine's passwords, tokens and addresses,
+4. run `docker compose up -d --build`.
+
+Jenkins, its plugins, Java, Git, the Docker CLI, the credentials, the SonarQube connection and the pipeline job all
+come from the files in this folder. Ubuntu needs **three small host settings** that Docker Desktop already handles for
+you – they are in [Part 2](#part-2--move-to-ubuntu-on-aws-ec2):
+
+| Host setting                      | Windows (Docker Desktop)         | Ubuntu (EC2)                                      |
+|-----------------------------------|----------------------------------|---------------------------------------------------|
+| Kernel limit for SonarQube's search engine (`vm.max_map_count`) | already set by Docker Desktop | one `sysctl` command ([E3](#step-e3--prepare-the-host-for-sonarqube-and-jenkins)) |
+| Group that owns the Docker socket (`DOCKER_GID` in `.env`) | `0`             | the `docker` group's number, e.g. `988`           |
+| Network access from outside       | localhost + ngrok for the GitHub webhook | AWS security group rules                  |
+
+The `.env` file is **not** in Git (it contains secrets), so you create it on each machine. Your data (build history,
+SonarQube analyses) can be carried over with the [backup and restore](#backup-and-restore) commands.
+
+---
+
+## What runs where
+
+```text
+ Docker host: your PC (Docker Desktop) or an Ubuntu EC2 instance
+ ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+ │  network cicd-network                                    network sonarqube-db (internal)  │
+ │                                                                                           │
+ │  ┌──────────────┐  analysis (token)   ┌──────────────┐  SQL   ┌──────────────┐           │
+ │  │   jenkins    │ ──────────────────▶ │  sonarqube   │ ─────▶ │ sonarqube-db │           │
+ │  │              │ ◀────────────────── │              │        │ (PostgreSQL) │           │
+ │  └──────┬───────┘  quality gate       └──────────────┘        └──────────────┘           │
+ │         │          (signed webhook)                                                       │
+ │         │ docker build / push / run  (through /var/run/docker.sock)                       │
+ │         ▼                                                                                 │
+ │  ┌────────────────────────┐   Smoke Test: http://simple-spring-boot-app:8080/api/hello    │
+ │  │ simple-spring-boot-app │   (deployed by the pipeline)                                  │
+ │  └────────────────────────┘                                                               │
+ └───────┬───────────────────────────────┬──────────────────────────────┬────────────────────┘
+         │ :8079                         │ :9000                        │ :8080
+     Jenkins UI                     SonarQube UI                   the application
+         ▲
+         │ webhook on every push (directly on EC2, through the optional ngrok container on a PC)
+       GitHub                                     Docker Hub ◀── docker push / pull
+```
+
+| Service (container) | Image                                  | Port on the host | Purpose                                 |
+|---------------------|----------------------------------------|------------------|-----------------------------------------|
+| `jenkins`           | `cicd-jenkins:2.580.2` (built here)    | **8079**         | Runs the pipeline (`Jenkinsfile`)       |
+| `sonarqube`         | `sonarqube:26.10.0.133078-community`   | **9000**         | Code quality analysis and quality gate  |
+| `sonarqube-db`      | `postgres:17`                          | none             | SonarQube's database                    |
+| `ngrok` (optional)  | `ngrok/ngrok:3.39.13-alpine`           | none             | Public HTTPS address for the GitHub webhook on a PC |
+| `backup` (on demand)| `postgres:17`                          | none             | Backup and restore                      |
+| `simple-spring-boot-app` | `manivannanbgi/simple-spring-boot-app:v<N>` | **8080** | The application, started by the pipeline (not by Compose) |
+
+Containers in the same network reach each other **by service name**: Jenkins calls `http://sonarqube:9000`, SonarQube
+calls `http://jenkins:8080`, and the Smoke Test calls `http://simple-spring-boot-app:8080`. Inside a container,
+`localhost` means *that container itself*.
+
+---
+
+## Folder structure
+
+```text
+simple-spring-boot-app/
+├── .gitattributes                  # NEW: keeps Unix line endings for files used inside Linux containers
+├── Jenkinsfile                     # CHANGED: Linux commands (sh) instead of Windows commands (bat)
+├── mvnw                            # CHANGED: marked as executable in Git (needed on Linux)
+├── Dockerfile, pom.xml, src/, ...  # the application – unchanged
+└── cicd/                           # NEW: the CI/CD environment
+    ├── README.md                   # this guide
+    ├── docker-compose.yml          # all services, volumes, networks and secrets
+    ├── .env.example                # template for .env (all settings, no secrets)
+    ├── .env                        # YOUR settings and secrets – created by you, never committed
+    ├── .gitignore                  # keeps .env and backups/ out of Git
+    ├── jenkins/
+    │   ├── Dockerfile              # Jenkins image: Jenkins LTS + Java 21 + Docker CLI + plugins + configuration
+    │   ├── plugins.txt             # Jenkins plugins with exact versions
+    │   └── casc.yaml               # Jenkins configuration as code: users, credentials, SonarQube, pipeline job
+    ├── backup/
+    │   ├── backup.sh               # backs up Jenkins data + SonarQube database
+    │   └── restore.sh              # restores such a backup
+    └── backups/                    # created by the first backup – never committed
+```
+
+Run every `docker compose` command **inside the `cicd` folder** – Compose reads `docker-compose.yml` and `.env` from
+the current folder.
+
+---
+
+## What replaced the manual Windows setup
+
+Everything you configured by hand in [CICD-GUIDE.md](../CICD-GUIDE.md) and [SONARQUBE-GUIDE.md](../SONARQUBE-GUIDE.md)
+is now a file in this folder:
+
+| Before (manual, on Windows)                                              | Now                                                                  |
+|--------------------------------------------------------------------------|----------------------------------------------------------------------|
+| Jenkins Windows installer, Windows service, port 8079                    | `jenkins` service in `docker-compose.yml`, `JENKINS_PORT` in `.env`  |
+| Unlock Jenkins, setup wizard, first admin user                           | Wizard switched off in `jenkins/Dockerfile`; admin user in `casc.yaml` from `JENKINS_ADMIN_USER` / `JENKINS_ADMIN_PASSWORD` |
+| Jenkins URL                                                              | `casc.yaml` → `location.url` from `JENKINS_PUBLIC_URL`               |
+| Install suggested plugins, SonarQube Scanner, Pipeline Graph View        | `jenkins/plugins.txt` (installed when the image is built)            |
+| JDK 21 + system `JAVA_HOME`                                              | Included in the base image `jenkins/jenkins:2.580.2-lts-jdk21`       |
+| Git for Windows on the service's `PATH`                                  | Included in the base image                                           |
+| Service runs as your Windows account, `icacls`, `PATH+TOOLS` for Docker  | Docker CLI in the image + Docker socket mounted + `DOCKER_GID`       |
+| Credentials `dockerhub-credentials`, `github-credentials`, `sonarqube-token` | `casc.yaml` → `credentials`, values from `.env`                  |
+| Manage Jenkins → System → SonarQube servers → `SonarQube`                | `casc.yaml` → `sonarGlobalConfiguration`                             |
+| New Item → Pipeline → *Pipeline script from SCM* + *GitHub hook trigger* | `casc.yaml` → `jobs` (Job DSL), from `GITHUB_REPO_URL` / `GITHUB_BRANCH` |
+| Manage Jenkins → Appearance → Pipeline Graph View ticks                  | `casc.yaml` → `appearance.pipelineGraphView`                         |
+| `docker run ... sonarqube` with the embedded H2 database                 | `sonarqube` + `sonarqube-db` (PostgreSQL – can be upgraded and backed up) |
+| SonarQube webhook to `http://host.docker.internal:8079/...`              | `http://jenkins:8080/sonarqube-webhook/` with a secret ([Step 7](#step-7--set-up-sonarqube-one-time)) |
+| ngrok installed on Windows                                               | Optional `ngrok` container ([Step 11](#step-11--build-automatically-on-every-push-github-webhook)) |
+| `bat '.\\mvnw.cmd ...'`, `%NAME%`, `localhost:8080` in the Smoke Test     | `sh './mvnw ...'`, `$NAME`, `simple-spring-boot-app:8080` ([Jenkinsfile](#jenkinsfile--what-changed)) |
+
+**Still done by hand, once per installation** (the results are stored in the volumes and survive restarts):
+creating the Docker Hub token, SonarQube's admin password, token, webhook and two settings ([Step 7](#step-7--set-up-sonarqube-one-time)),
+and the webhook in GitHub ([Step 11](#step-11--build-automatically-on-every-push-github-webhook)).
+
+---
+
+## Part 1 – Set up on Windows (Docker Desktop)
+
+Follow the steps in order; each one ends with a check. Use **PowerShell** for the commands (Git Bash works too, see
+[Troubleshooting](#troubleshooting) for one Git Bash pitfall).
+
+### Step 1 – Docker Desktop
+
+Docker Desktop is the only program the CI/CD environment needs on Windows.
+
+1. If it isn't installed: download it from https://www.docker.com/products/docker-desktop/, install it with the
+   **WSL 2** option, and restart Windows when asked.
+2. Docker Desktop → **Settings** → **General** → tick **Start Docker Desktop when you sign in to your computer** → **Apply**.
+3. Memory: SonarQube, Jenkins and a Maven build together need about **6 GB**. Docker Desktop (WSL 2) may use half of
+   your PC's memory by default. Check:
+
+   ```powershell
+   docker info --format "{{.MemTotal}}"     # bytes; 6 GB = about 6000000000
+   ```
+
+   If it is lower, create `%USERPROFILE%\.wslconfig` with the two lines `[wsl2]` and `memory=8GB`, run
+   `wsl --shutdown`, and start Docker Desktop again.
+
+**Check:**
+
+```powershell
+docker version            # shows a Client and a Server section
+docker compose version    # Docker Compose version v2.30 or newer (Docker Desktop includes it)
+```
+
+> Docker Desktop runs only while you are signed in to Windows. For a build server that runs 24/7, use
+> [Part 2](#part-2--move-to-ubuntu-on-aws-ec2).
+
+### Step 2 – Retire the old Windows setup
+
+The new containers need ports **8079** and **9000**, which the old Jenkins service and the old SonarQube container
+still use. Stop them (nothing is deleted yet – [Step 13](#step-13--remove-the-old-windows-setup) removes them once the
+new setup works).
+
+In **PowerShell as Administrator**:
+
+```powershell
+Stop-Service Jenkins
+Set-Service Jenkins -StartupType Disabled     # don't start again after a reboot
+```
+
+In a normal PowerShell:
+
+```powershell
+docker stop sonarqube                         # the old SonarQube container (H2 database)
+docker update --restart=no sonarqube          # don't start again with Docker Desktop
+```
+
+If the old **ngrok** window is still open, stop it with **Ctrl + C**.
+
+The deployed application (container `simple-spring-boot-app`) can keep running – the first build of the new pipeline
+replaces it.
+
+> The old SonarQube data can't be moved over: SonarQube's embedded H2 database can't be migrated to PostgreSQL.
+> SonarQube starts fresh; your next analysis becomes the new starting point. The old Jenkins build history isn't moved
+> either – the new Jenkins starts with build #1.
+
+**Check:** `netstat -ano | findstr ":8079 :9000"` shows no `LISTENING` lines.
+
+### Step 3 – Commit and push the project changes
+
+Jenkins reads the `Jenkinsfile` and the code **from GitHub**, so the changes must be pushed before the first build:
+
+- `Jenkinsfile` – Linux commands (the old one only works on Windows Jenkins).
+- `mvnw` – marked executable in Git (Linux won't run it otherwise). This change is already staged.
+- `.gitattributes` and the `cicd/` folder.
+- Your other changes that the pipeline needs (for example JaCoCo, failsafe and the SonarQube plugin in `pom.xml`, and
+  the new test classes).
+
+```powershell
+cd "D:\Drive E\dev\test\simple-spring-boot-app"
+git status                     # review the list
+git add -A
+git commit -m "Run Jenkins and SonarQube with Docker Compose"
+git push
+```
+
+> If `git status` lists files under `target/`: they were committed before `.gitignore` existed. Remove them from
+> Git once (the files on disk stay): `git rm -r --cached target`, then commit.
+
+**Check:** on GitHub, `mvnw` shows as executable and the `cicd` folder is there – **without** a `.env` file.
+
+### Step 4 – Create the access tokens
+
+**Docker Hub (required).** Jenkins pushes the image with an access token, never your password.
+
+1. https://hub.docker.com → your avatar → **Account settings** → **Personal access tokens** → **Generate new token**.
+2. **Description:** `jenkins` – **Access permissions:** **Read & Write** → **Generate**.
+3. Copy the token now (shown only once). It goes into `DOCKERHUB_TOKEN` in Step 5.
+
+**GitHub (only for a private repository).** The repository is public, so Jenkins needs no GitHub credentials. If you
+make it private: GitHub → **Settings** → **Developer settings** → **Personal access tokens** → **Fine-grained tokens**
+→ **Generate new token** → repository `simple-spring-boot-app` → **Contents: Read-only**. It goes into
+`GITHUB_USERNAME` / `GITHUB_TOKEN`.
+
+### Step 5 – Create the `.env` file
+
+```powershell
+cd "D:\Drive E\dev\test\simple-spring-boot-app\cicd"
+Copy-Item .env.example .env
+notepad .env
+```
+
+Fill in these values (every variable is explained in [.env – all settings](#env--all-settings)):
+
+| Variable                 | What to enter                                                                     |
+|--------------------------|-----------------------------------------------------------------------------------|
+| `JENKINS_ADMIN_PASSWORD` | A strong password for the Jenkins user `admin`                                    |
+| `DOCKERHUB_TOKEN`        | The Docker Hub token from Step 4                                                  |
+| `SONARQUBE_DB_PASSWORD`  | A strong password for SonarQube's database – choose it now and keep it            |
+| `SONAR_WEBHOOK_SECRET`   | A long random text (command below) – you also type it into SonarQube in Step 7    |
+| `SONAR_TOKEN`            | **Leave empty for now** – SonarQube creates it in Step 7                          |
+
+Create a random secret in PowerShell:
+
+```powershell
+$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { '{0:x2}' -f $_ })
+```
+
+(Linux / Git Bash: `openssl rand -hex 32`.)
+
+Leave the other values as they are: `DOCKER_GID=0` is right for Docker Desktop, and the GitHub and Docker Hub
+names are already yours. **Keep every line in the file**, even when its value is empty.
+
+**Check:** `docker compose config --quiet` prints nothing. If a required value is missing it prints, for example,
+`required variable SONARQUBE_DB_PASSWORD is missing a value`.
+
+### Step 6 – Start the containers
+
+```powershell
+docker compose up -d --build
+```
+
+- `up` creates and starts all containers, `-d` runs them in the background, `--build` builds the Jenkins image from
+  `jenkins/Dockerfile`.
+- The first start downloads about 3 GB of images and takes a few minutes. Jenkins is ready after about 1 minute,
+  SonarQube after 2–3 minutes.
+
+**Check:**
+
+```powershell
+docker compose ps
+```
+
+Wait until all three show **`(healthy)`**:
+
+```text
+NAME                  IMAGE                                SERVICE        STATUS
+cicd-jenkins-1        cicd-jenkins:2.580.2                 jenkins        Up 3 minutes (healthy)
+cicd-sonarqube-1      sonarqube:26.10.0.133078-community   sonarqube      Up 3 minutes (healthy)
+cicd-sonarqube-db-1   postgres:17                          sonarqube-db   Up 3 minutes (healthy)
+```
+
+`(health: starting)` means "still starting" – wait. If a service doesn't become healthy, look at its log:
+`docker compose logs sonarqube` (or `jenkins`).
+
+### Step 7 – Set up SonarQube (one time)
+
+Open **http://localhost:9000**.
+
+**7.1 Admin password.** Log in with `admin` / `admin`. SonarQube asks for a new password – choose a strong one and keep
+it in your password manager.
+
+**7.2 Two settings.** **Administration** → **Configuration** → **General Settings**:
+
+| Category  | Setting                              | Value                         | Why                                                        |
+|-----------|--------------------------------------|-------------------------------|------------------------------------------------------------|
+| General   | **Server base URL**                  | `http://localhost:9000`       | The links in Jenkins and in the build log point here       |
+| Security  | **Enable local webhooks validation** | **off**                       | Otherwise SonarQube refuses webhooks to private addresses, which includes the `jenkins` container |
+
+Click **Save** after each change.
+
+> Turning off the validation is safe here: only SonarQube administrators can create webhooks, and the webhook below
+> is signed with a secret that Jenkins checks.
+
+**7.3 Webhook to Jenkins.** **Administration** → **Configuration** → **Webhooks** → **Create**:
+
+| Field  | Value                                                         |
+|--------|---------------------------------------------------------------|
+| Name   | `Jenkins`                                                     |
+| URL    | `http://jenkins:8080/sonarqube-webhook/` – the final `/` is required |
+| Secret | the value of `SONAR_WEBHOOK_SECRET` from your `.env`          |
+
+The URL uses the container name `jenkins` and Jenkins' **container** port 8080 (not 8079) because the call goes
+from container to container. This URL is the same on every machine.
+
+**7.4 Token for Jenkins.** Avatar (top right) → **My Account** → **Security** → **Generate Tokens**:
+**Name** `jenkins`, **Type** **User Token**, **Expires in** e.g. 90 days → **Generate** → copy the token (`squ_…`).
+
+**Check:** **Webhooks** lists `Jenkins` with the URL above; **My Account → Security** lists the token `jenkins`.
+
+### Step 8 – Give Jenkins the SonarQube token
+
+1. Put the token into `.env`: `SONAR_TOKEN=squ_...`
+2. Recreate the Jenkins container, so it reads the new value:
+
+   ```powershell
+   docker compose up -d --force-recreate jenkins
+   ```
+
+> Why `--force-recreate`? Docker Compose doesn't notice when only a **secret** in `.env` changes, so a plain
+> `docker compose up -d` would keep the old value. Jenkins' build history and jobs are in the `jenkins_home` volume and
+> are not affected by recreating the container.
+
+**Check:** after about a minute `docker compose ps` shows `jenkins` as `(healthy)` again.
+
+### Step 9 – Log in to Jenkins and check the configuration
+
+Open **http://localhost:8079** and log in as `admin` with `JENKINS_ADMIN_PASSWORD`.
+
+Everything is already configured by `jenkins/casc.yaml` – check that it is there:
+
+| Where                                                | What you should see                                                        |
+|------------------------------------------------------|----------------------------------------------------------------------------|
+| Dashboard                                            | The job **simple-spring-boot-app**, and a message that Jenkins is configured by `casc.yaml` |
+| **Manage Jenkins** → **Credentials**                 | `dockerhub-credentials`, `github-credentials`, `sonarqube-token`, `sonarqube-webhook-secret` |
+| **Manage Jenkins** → **System** → *SonarQube servers* | `SonarQube` – `http://sonarqube:9000` – token `sonarqube-token`            |
+| **Manage Jenkins** → **Appearance** → *Pipeline Graph View* | Graph on job page and build page, stage names and durations – all ticked |
+| **Manage Jenkins** → **Plugins** → **Installed plugins** | Configuration as Code, Job DSL, Pipeline, Git, GitHub, Credentials Binding, JUnit, Pipeline Graph View, SonarQube Scanner |
+| Job → **Configure**                                  | *GitHub hook trigger for GITScm polling* ticked; *Pipeline script from SCM*, Git, your repository URL, branch `*/master`, script path `Jenkinsfile` |
+
+> **Change settings in the files, not in the web UI.** Jenkins applies `casc.yaml` at every start, so a setting
+> changed only in the UI is overwritten at the next restart. See [Changing settings](#changing-settings-and-rotating-tokens).
+
+> Jenkins may show the warning **"Building on the built-in node can be a security issue"**. Builds run on the Jenkins
+> container itself, which is the simplest setup for one team. The usual next step is a separate build agent – see
+> [Security notes](#security-notes).
+
+### Step 10 – Run the pipeline
+
+Job **simple-spring-boot-app** → **Build Now**.
+
+The first build takes a few minutes: the Maven Wrapper downloads Maven and all dependencies into the `jenkins_home`
+volume (later builds reuse them). **Run this first build by hand** – after it, the GitHub webhook can start builds.
+
+**Check:** the build turns green with 13 stages – [Step 12](#step-12--check-every-stage) shows what each one prints.
+
+### Step 11 – Build automatically on every push (GitHub webhook)
+
+GitHub must reach Jenkins from the internet. `http://localhost:8079` exists only on your PC, so on a PC the optional
+**ngrok** container gives Jenkins a public HTTPS address. (On EC2 you use the instance's address instead –
+[Step E5](#step-e5--start-and-finish-the-setup).)
+
+1. Create a free account at https://ngrok.com → dashboard → **Your Authtoken** → copy it into `.env`:
+   `NGROK_AUTHTOKEN=...`
+2. Start the tunnel (the profile `tunnel` switches the `ngrok` service on):
+
+   ```powershell
+   docker compose --profile tunnel up -d
+   docker compose logs ngrok
+   ```
+
+   The log contains a line with `url=https://<name>.ngrok-free.app` – that is Jenkins' public address. Free accounts
+   get one fixed domain (ngrok dashboard → **Domains**), so the address stays the same after restarts.
+3. GitHub repository → **Settings** → **Webhooks** → edit the existing webhook (from the old setup) or **Add webhook**:
+
+   | Field         | Value                                                         |
+   |---------------|---------------------------------------------------------------|
+   | Payload URL   | `https://<name>.ngrok-free.app/github-webhook/` – the final `/github-webhook/` is required |
+   | Content type  | `application/json`                                            |
+   | Which events  | **Just the push event**                                       |
+   | Active        | ticked                                                        |
+
+**Check:**
+
+1. GitHub → **Webhooks** → your webhook → **Recent Deliveries**: green tick, response **200**.
+2. Push a small change. A new build starts within seconds; the build page says **Started by GitHub push by …**.
+
+> ngrok makes your Jenkins reachable from the internet. Jenkins requires a login for everything except the webhook
+> address. Stop the tunnel when you don't need it: `docker compose --profile tunnel stop ngrok`.
+
+**No webhook possible?** Let Jenkins check GitHub every 2 minutes instead: in `jenkins/casc.yaml` replace
+`githubPush()` with `pollSCM { scmpoll_spec('H/2 * * * *') }`, then `docker compose up -d --build`.
+
+### Step 12 – Check every stage
+
+Open the job: the **Pipeline Graph View** shows the stages of the recent builds. Click a build, then a stage, to see
+that stage's log; the full log is in **Console Output**.
+
+| #  | Stage              | What happens                                                | Success looks like this in the log |
+|----|--------------------|-------------------------------------------------------------|------------------------------------|
+| 1  | Checkout           | Gets the code from GitHub                                   | `Checking out Revision 1a2b3c… (refs/remotes/origin/master)` |
+| 2  | Build              | Compiles (`./mvnw -B clean compile`)                        | `BUILD SUCCESS` |
+| 3  | Unit Tests         | Runs the unit tests (`./mvnw -B test`) and JaCoCo coverage  | `Tests run: 5, Failures: 0, Errors: 0, Skipped: 0` |
+| 4  | Integration Tests  | Starts the application on a random port, tests it over HTTP | `Tests run: 8, Failures: 0, Errors: 0, Skipped: 0` |
+| 5  | SonarQube Analysis | Sends code, test results and coverage to SonarQube          | `ANALYSIS SUCCESSFUL, you can find the results at: http://localhost:9000/dashboard?id=simple-spring-boot-app` |
+| 6  | Quality Gate       | Waits for SonarQube's verdict (webhook)                     | `SonarQube task '…' completed. Quality gate is 'OK'` |
+| 7  | Package JAR        | Builds and archives the JAR                                 | `Building jar: /var/jenkins_home/workspace/simple-spring-boot-app/target/simple-spring-boot-app-v<N>.jar` |
+| 8  | Docker Build       | Builds the image, tagged `v<N>` and `latest`                | `naming to docker.io/manivannanbgi/simple-spring-boot-app:v<N> done` |
+| 9  | Docker Login       | Logs in to Docker Hub with the token                        | `Login Succeeded` |
+| 10 | Docker Push        | Uploads both tags                                           | `v<N>: digest: sha256:…` |
+| 11 | Docker Pull        | Deletes the local copy, downloads it from Docker Hub        | `Status: Downloaded newer image for manivannanbgi/simple-spring-boot-app:v<N>` |
+| 12 | Deploy             | Replaces the running container                              | a 64-character container ID |
+| 13 | Smoke Test         | Calls the API of the new container                          | `{"message":"Hello! Spring Boot application is running successfully."}` |
+
+After the stages, **Declarative: Post Actions** logs out of Docker Hub: `Removing login credentials for https://index.docker.io/v1/`.
+
+`<N>` is the Jenkins build number. In the Smoke Test you may first see
+`curl: (7) Failed to connect to simple-spring-boot-app port 8080` – normal: the application was still starting and curl retried.
+
+**Check the application:** open http://localhost:8080/api/hello. The image is on Docker Hub under **Tags**, and the
+build page shows the test results, the JAR under **Build Artifacts** and a **SonarQube Quality Gate** badge.
+
+### Step 13 – Remove the old Windows setup
+
+Only after the new pipeline has run successfully:
+
+| What                         | How                                                                                 |
+|------------------------------|-------------------------------------------------------------------------------------|
+| Jenkins Windows service      | Windows **Settings** → **Apps** → **Jenkins** → **Uninstall**; then delete `C:\ProgramData\Jenkins` and `D:\Jenkins` |
+| Old SonarQube container + data | `docker rm sonarqube` then `docker volume rm sonarqube_data sonarqube_extensions sonarqube_logs` |
+| ngrok on Windows             | `winget uninstall ngrok.ngrok` (or delete the downloaded `ngrok.exe`)               |
+
+Keep JDK 21 and Git – you still use them to develop. The CI/CD environment no longer needs them.
+
+---
+
+## Part 2 – Move to Ubuntu on AWS EC2
+
+The same files, the same commands. Only the host preparation and a few `.env` values differ.
+
+### Step E1 – Create the EC2 instance
+
+| Setting            | Recommended value                                                                          |
+|--------------------|--------------------------------------------------------------------------------------------|
+| AMI                | **Ubuntu Server 24.04 LTS** (64-bit x86)                                                    |
+| Instance type      | **t3.large** (2 vCPU, 8 GiB) at least – SonarQube alone uses 2–3 GiB. `t3.medium` (4 GiB) is too small. |
+| Storage            | **30 GiB gp3** or more (images, Maven cache, build history)                                |
+| Key pair           | Create one and keep the `.pem` file – you need it for `ssh` and `scp`                       |
+| Elastic IP         | Allocate one and associate it with the instance, so its address doesn't change on restart (the GitHub webhook uses it) |
+
+**Security group (inbound rules)** – open only what is needed, and only to whom:
+
+| Port | Who needs it                                   | Source                                                         |
+|------|------------------------------------------------|----------------------------------------------------------------|
+| 22   | You (SSH)                                      | **My IP**                                                      |
+| 8079 | You (Jenkins UI) and GitHub (webhook)          | **My IP** + GitHub's webhook ranges (the `hooks` list at https://api.github.com/meta) |
+| 9000 | You (SonarQube UI)                             | **My IP**                                                      |
+| 8080 | Users of the deployed application              | as needed                                                      |
+
+> Even safer: open 8079 only for GitHub's ranges and 9000 not at all, and reach both UIs through SSH:
+> `ssh -i key.pem -L 8079:localhost:8079 -L 9000:localhost:9000 ubuntu@<elastic-ip>`, then open
+> http://localhost:8079 and http://localhost:9000 on your PC. The connection is encrypted by SSH.
+
+### Step E2 – Install Docker Engine and Docker Compose
+
+Connect: `ssh -i key.pem ubuntu@<elastic-ip>`. Then install Docker from **Docker's own repository** (Ubuntu's
+`docker.io` package and the snap package are older or behave differently):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Let the 'ubuntu' user run docker without sudo, then log out and in again
+sudo usermod -aG docker "$USER"
+exit
+```
+
+**Check** (after `ssh` again):
+
+```bash
+docker version                 # Client and Server
+docker compose version         # v2.30 or newer
+docker run --rm hello-world    # "Hello from Docker!"
+systemctl is-enabled docker    # enabled = Docker (and with it all containers) starts at boot
+```
+
+### Step E3 – Prepare the host for SonarQube and Jenkins
+
+**SonarQube's search engine** needs a higher kernel limit. Set it now and for every future boot:
+
+```bash
+echo "vm.max_map_count=524288" | sudo tee /etc/sysctl.d/99-sonarqube.conf
+sudo sysctl --system
+sysctl vm.max_map_count        # vm.max_map_count = 524288
+```
+
+**The Docker socket's group:** Jenkins may run docker commands only as a member of the group that owns
+`/var/run/docker.sock`. Find its number:
+
+```bash
+getent group docker | cut -d: -f3      # for example 988 - you need it for DOCKER_GID in Step E4
+```
+
+### Step E4 – Get the files and create `.env`
+
+```bash
+git clone https://github.com/Manivannanbgi007/simple-spring-boot-app.git
+cd simple-spring-boot-app/cicd
+cp .env.example .env
+chmod 600 .env                 # only you can read it
+nano .env
+```
+
+Fill in `.env` as in [Step 5](#step-5--create-the-env-file), with these differences:
+
+| Variable             | On EC2                                                                               |
+|----------------------|--------------------------------------------------------------------------------------|
+| `JENKINS_PUBLIC_URL` | `http://<elastic-ip or public DNS name>:8079/` (or `http://localhost:8079/` if you use the SSH tunnel) |
+| `DOCKER_GID`         | the number from Step E3, e.g. `988`                                                  |
+| `NGROK_AUTHTOKEN`    | leave empty – not needed on EC2                                                      |
+
+Use **new** passwords and tokens for the server (a separate Docker Hub token makes it easy to revoke one machine's
+access), unless you carry over your data in Step E6.
+
+### Step E5 – Start and finish the setup
+
+```bash
+docker compose up -d --build
+docker compose ps              # wait for (healthy)
+```
+
+Then do [Steps 7–12](#step-7--set-up-sonarqube-one-time) as on Windows, with the EC2 address instead of `localhost`:
+
+- SonarQube **Server base URL**: `http://<elastic-ip>:9000` (or `http://localhost:9000` with the SSH tunnel).
+- The SonarQube **webhook** is the same: `http://jenkins:8080/sonarqube-webhook/`.
+- **GitHub webhook Payload URL:** `http://<elastic-ip>:8079/github-webhook/` – no ngrok needed. If the PC's Jenkins
+  should stop building, delete (or deactivate) its webhook in GitHub.
+
+### Step E6 – Take your data along (optional)
+
+To keep the build history and the SonarQube analyses from the PC:
+
+1. **On the PC**, in the `cicd` folder – make a backup ([details](#backup-and-restore)):
+
+   ```powershell
+   docker compose stop jenkins
+   docker compose run --rm backup
+   docker compose start jenkins
+   ```
+
+2. Copy the backup folder to the server (Windows 10/11 include `scp`):
+
+   ```powershell
+   scp -i key.pem -r backups\2026-11-03_0930 ubuntu@<elastic-ip>:~/simple-spring-boot-app/cicd/backups/
+   ```
+
+3. **On the server**, after Step E5's `docker compose up -d` has created the volumes:
+
+   ```bash
+   docker compose stop jenkins sonarqube
+   docker compose run --rm backup restore.sh 2026-11-03_0930
+   docker compose start jenkins sonarqube
+   ```
+
+4. The SonarQube database now comes from the PC, so on the server use the **PC's** `SONAR_TOKEN` and
+   `SONAR_WEBHOOK_SECRET` in `.env` (`docker compose up -d --force-recreate jenkins`), log in to SonarQube with the
+   PC's admin password, and set **Server base URL** to the server's address. Jenkins' settings come from the server's
+   `.env` and `casc.yaml` as usual.
+
+### Step E7 – Before real production use
+
+The setup above is complete and works. For a team server on the internet, plan these next:
+
+- **HTTPS** in front of Jenkins and SonarQube – an AWS Application Load Balancer with an ACM certificate, or a
+  reverse proxy container (for example Caddy or nginx). Until then, use the SSH tunnel or restrict the security group.
+- **Automatic backups**, for example a nightly cron job that runs the backup and copies `backups/` to S3
+  (`aws s3 sync backups s3://<bucket>/cicd-backups/`).
+- **A separate build agent** (see [Security notes](#security-notes)).
+- **Amazon RDS for PostgreSQL** instead of the `sonarqube-db` container: point `SONAR_JDBC_URL` in
+  `docker-compose.yml` at the RDS endpoint and remove the `sonarqube-db` service.
+
+---
+
+## The files explained
+
+### docker-compose.yml
+
+The file describes the whole environment. The important parts, from top to bottom:
+
+**`name: cicd`** – the project name. Compose puts it in front of the volume names (`cicd_jenkins_home`, …) and
+container names (`cicd-jenkins-1`, …), so they are the same on every machine.
+
+**`services:`** – one entry per container.
+
+| Service        | Key settings                                                                                    |
+|----------------|--------------------------------------------------------------------------------------------------|
+| `jenkins`      | `build: ./jenkins` builds the image from `jenkins/Dockerfile` and names it `cicd-jenkins:2.580.2`. `ports: "8079:8080"` = port 8079 on the host → 8080 in the container. `environment:` passes the non-secret settings to `casc.yaml`; `secrets:` passes the secret ones as files. `group_add: DOCKER_GID` lets the `jenkins` user use the Docker socket. Volumes: `jenkins_home` (all Jenkins data) and the Docker socket. |
+| `sonarqube`    | Exact image version. `depends_on … service_healthy` = start only when the database is ready. `SONAR_JDBC_*` = how to reach the database. `ulimits` = the open-file and thread limits SonarQube's search engine requires. In both networks: `cicd` (Jenkins reaches it) and `sonarqube-db` (it reaches its database). |
+| `sonarqube-db` | PostgreSQL 17. `POSTGRES_*` create the database `sonar` and user `sonar` on the **first** start. Only in the internal `sonarqube-db` network and **no `ports:`** – nothing outside can reach it. |
+| `ngrok`        | `profiles: [tunnel]` = starts only with `docker compose --profile tunnel up -d`. Forwards a public HTTPS address to `jenkins:8080`. |
+| `backup`       | `profiles: [backup]` = never starts with `up`; run it with `docker compose run --rm backup`. Uses the PostgreSQL image for `pg_dump`/`pg_restore` and mounts the volumes it backs up. |
+
+**Common settings:**
+
+| Setting                    | Meaning                                                                                       |
+|----------------------------|-----------------------------------------------------------------------------------------------|
+| `restart: unless-stopped`  | Docker starts the container again after a crash or a reboot, unless you stopped it yourself    |
+| `healthcheck:`             | A command Docker runs regularly. `docker compose ps` shows `(healthy)` when it succeeds. Jenkins: the login page answers; SonarQube: `/api/system/status` says `UP`; database: `pg_isready` |
+| `${NAME:-default}`         | The value of `NAME` from `.env`, or `default` if it is empty                                   |
+| `${NAME:?message}`         | The value of `NAME`; if it is empty, Compose stops with `message` – used for required values    |
+
+**`secrets:`** – each secret is created from a `.env` variable (`environment: DOCKERHUB_TOKEN`) and appears inside
+the Jenkins container as a file, e.g. `/run/secrets/dockerhub_token`. Jenkins reads the files; builds don't see them as
+environment variables, so a `sh 'env'` in a Jenkinsfile can't print them. Builds get secrets only through
+`withCredentials`, where Jenkins masks them as `****`.
+
+**`volumes:`** – named volumes: storage that Docker keeps outside the containers. See
+[Persistent data](#persistent-data-volumes).
+
+**`networks:`**
+
+| Network                    | Members                                      | Notes                                                    |
+|----------------------------|----------------------------------------------|----------------------------------------------------------|
+| `cicd-network`             | jenkins, sonarqube, ngrok, the deployed application | The fixed name `cicd-network` is used by the Jenkinsfile (`DOCKER_NETWORK`) to put the deployed container into this network |
+| `cicd_sonarqube-db`        | sonarqube, sonarqube-db, backup              | `internal: true` – no traffic to or from outside this network |
+
+### .env – all settings
+
+`.env` is read by Docker Compose from the `cicd` folder. Lines starting with `#` are comments. Values need no quotes.
+
+| Variable                 | Used by                      | Secret | Example / default                                   | Meaning |
+|--------------------------|------------------------------|--------|-----------------------------------------------------|---------|
+| `JENKINS_PORT`           | `jenkins` port               | no     | `8079`                                              | Port of the Jenkins UI on the host |
+| `JENKINS_PUBLIC_URL`     | `casc.yaml` → Jenkins URL    | no     | `http://localhost:8079/`                            | Address people use to open Jenkins (with final `/`) |
+| `JENKINS_ADMIN_USER`     | `casc.yaml` → user           | no     | `admin`                                             | Jenkins administrator login |
+| `JENKINS_ADMIN_PASSWORD` | secret → `casc.yaml`         | **yes**| –                                                   | Its password – set again at every start |
+| `DOCKER_GID`             | `jenkins` → `group_add`      | no     | `0` (Docker Desktop), e.g. `988` (Ubuntu)           | Group owning the Docker socket |
+| `GITHUB_REPO_URL`        | `casc.yaml` → job            | no     | `https://github.com/Manivannanbgi007/simple-spring-boot-app.git` | Repository the job builds |
+| `GITHUB_BRANCH`          | `casc.yaml` → job            | no     | `master`                                            | Branch the job builds |
+| `GITHUB_USERNAME`        | `casc.yaml` → `github-credentials` | no | empty                                             | Private repository only |
+| `GITHUB_TOKEN`           | secret → `github-credentials`| **yes**| empty                                               | Private repository only (Contents: Read-only) |
+| `DOCKERHUB_USERNAME`     | `casc.yaml` → `dockerhub-credentials` | no | `manivannanbgi`                               | Docker Hub user |
+| `DOCKERHUB_TOKEN`        | secret → `dockerhub-credentials` | **yes** | –                                               | Docker Hub access token (Read & Write) |
+| `SONARQUBE_PORT`         | `sonarqube` port             | no     | `9000`                                              | Port of the SonarQube UI on the host |
+| `SONAR_TOKEN`            | secret → `sonarqube-token`   | **yes**| empty until Step 7                                  | Token Jenkins uses for the analysis |
+| `SONAR_WEBHOOK_SECRET`   | secret → `sonarqube-webhook-secret` | **yes** | –                                            | Same text as the webhook secret in SonarQube |
+| `SONARQUBE_DB_PASSWORD`  | `sonarqube`, `sonarqube-db`, `backup` | **yes** | –                                          | Database password (set once – see [Changing settings](#changing-settings-and-rotating-tokens)) |
+| `NGROK_AUTHTOKEN`        | `ngrok`                      | **yes**| empty                                               | Only for the optional tunnel on a PC |
+
+> The image name `manivannanbgi/simple-spring-boot-app` is set in the `Jenkinsfile` (`DOCKER_IMAGE`), because it
+> belongs to the application. If the Docker Hub account changes, change both `DOCKERHUB_USERNAME` and `DOCKER_IMAGE`.
+
+### jenkins/Dockerfile
+
+Builds the Jenkins image, so nothing has to be installed by hand:
+
+| Line                                             | Purpose                                                                 |
+|--------------------------------------------------|-------------------------------------------------------------------------|
+| `FROM jenkins/jenkins:2.580.2-lts-jdk21`         | Official Jenkins LTS with Java 21, Git and curl (Debian Linux)          |
+| `COPY --from=docker:29.9.2-cli …`                | Copies the Docker command-line tool and its `buildx` plugin from the official Docker image. Only the client: it sends commands to the host's Docker Engine through the socket |
+| `COPY plugins.txt` + `RUN jenkins-plugin-cli …`  | Installs the plugins at build time                                      |
+| `COPY casc.yaml` + `ENV CASC_JENKINS_CONFIG=…`   | Tells the Configuration as Code plugin where the configuration is       |
+| `ENV JAVA_OPTS=-Djenkins.install.runSetupWizard=false` | No setup wizard – `casc.yaml` already creates the admin user      |
+
+The image runs as the normal user `jenkins` (not root).
+
+### jenkins/plugins.txt – the required plugins
+
+One plugin per line as `<plugin-id>:<version>`; their dependencies (about 65 plugins) are installed automatically.
+
+| Plugin ID               | Name                      | Why the pipeline needs it                                        |
+|-------------------------|---------------------------|------------------------------------------------------------------|
+| `configuration-as-code` | Configuration as Code     | Applies `casc.yaml` at every start                               |
+| `job-dsl`               | Job DSL                   | Creates the pipeline job described in `casc.yaml`                |
+| `workflow-aggregator`   | Pipeline                  | Runs the `Jenkinsfile`                                           |
+| `git`                   | Git                       | `checkout scm`                                                   |
+| `github`                | GitHub                    | Receives the GitHub webhook and starts the build                 |
+| `credentials-binding`   | Credentials Binding       | `withCredentials(...)` for the Docker Hub token                  |
+| `junit`                 | JUnit                     | `junit '...'` – test results on the build page                   |
+| `pipeline-graph-view`   | Pipeline Graph View       | Stage diagram on the job and build pages                         |
+| `sonar`                 | SonarQube Scanner         | `withSonarQubeEnv(...)` and `waitForQualityGate`                 |
+
+Not needed: "Docker Pipeline", "Maven Integration" (the pipeline uses plain `./mvnw` and `docker` commands) and
+"Pipeline: Stage View" (replaced by Pipeline Graph View).
+
+### jenkins/casc.yaml – Jenkins configuration as code
+
+Jenkins applies this file **at every start**. Its sections:
+
+| Section                                | What it configures                                                            |
+|----------------------------------------|-------------------------------------------------------------------------------|
+| `jenkins.systemMessage`                | The note on the dashboard                                                     |
+| `jenkins.numExecutors: 2`              | Two builds can run at the same time                                           |
+| `jenkins.securityRealm`                | Jenkins' own user database with the admin user; nobody can sign up            |
+| `jenkins.authorizationStrategy`        | Logged-in users can do everything; anonymous visitors see only the login page |
+| `unclassified.location.url`            | The Jenkins URL                                                               |
+| `unclassified.sonarGlobalConfiguration`| SonarQube server `SonarQube` at `http://sonarqube:9000` with the token and the webhook secret |
+| `appearance.pipelineGraphView`         | Pipeline Graph View on job and build pages                                    |
+| `credentials`                          | The four credentials (IDs used by the Jenkinsfile and the SonarQube server)   |
+| `jobs`                                 | The pipeline job, written in Job DSL: repository, branch, `Jenkinsfile`, GitHub push trigger |
+
+`${NAME}` is filled in when Jenkins starts: `UPPER_CASE` names come from environment variables, `lower_case` names
+from the secret files in `/run/secrets/`, and `${name:-}` means "empty if not set".
+
+### Jenkinsfile – what changed
+
+The 13 stages are the same. Jenkins now runs in a **Linux** container, so the commands changed:
+
+| Before (Windows Jenkins)                               | Now (Linux container)                                         | Why |
+|--------------------------------------------------------|---------------------------------------------------------------|-----|
+| `bat '.\\mvnw.cmd -B ...'`                             | `sh './mvnw -B ...'`                                          | Linux shell and the Linux Maven Wrapper |
+| `%NAME%`                                               | `$NAME` (inside single quotes)                                | Shell syntax; single quotes let the shell, not Groovy, read the value – secrets stay out of the log |
+| `echo %DOCKERHUB_TOKEN%\| docker login ...`             | `echo "$DOCKERHUB_TOKEN" \| docker login ... --password-stdin` | Same, Linux syntax |
+| `docker rm -f ... \|\| exit /b 0`                       | `docker rm -f ... \|\| true`                                  | "No error if there is no old container" |
+| `docker run -d ... -p 8080:8080 ...`                   | adds `--network "$DOCKER_NETWORK"` (`cicd-network`)            | So Jenkins can reach the new container by name |
+| Smoke Test `curl http://localhost:8080/api/hello`      | `curl http://$CONTAINER_NAME:8080/api/hello`                  | Inside the Jenkins container `localhost` is Jenkins itself |
+| no `docker logout`                                     | `post { always { sh 'docker logout' } }`                      | Don't leave the Docker Hub login stored in `jenkins_home` |
+
+The `docker` commands run on the **host's** Docker Engine (through the socket). So the image and the deployed container
+appear in `docker images` / `docker ps` on the host, exactly as before. One consequence for future changes: in a
+`docker run -v <path>:...` inside the pipeline, `<path>` would be a path on the **host**, not in the Jenkins container.
+
+### backup/, .gitattributes, .gitignore
+
+- **`backup/backup.sh`** – writes `backups/<date_time>/jenkins_home.tar.gz` (jobs, build history, credentials,
+  settings) and `sonarqube_db.dump` (the whole SonarQube database). It leaves out what is recreated automatically:
+  workspaces, download caches, plugins and Jenkins' program files. A backup is about 25 MB plus the archived JARs.
+- **`backup/restore.sh`** – puts such a backup back and deletes SonarQube's search index, which SonarQube rebuilds
+  from the database.
+- **`.gitattributes`** (project root) – `mvnw`, `*.sh` and everything in `cicd/` keep Unix line endings (LF), also
+  when checked out on Windows. Linux can't run scripts with Windows line endings (`bad interpreter`, `$'\r'`).
+- **`cicd/.gitignore`** – keeps `.env` and `backups/` out of Git; both contain secrets.
+
+---
+
+## Persistent data (volumes)
+
+Containers are disposable: they are deleted and recreated on upgrades and configuration changes. Everything that must
+survive lives in **named volumes**.
+
+| Volume                      | Mounted at (container)        | Contains                                                              | If it is lost |
+|-----------------------------|-------------------------------|-----------------------------------------------------------------------|---------------|
+| `cicd_jenkins_home`         | `/var/jenkins_home`           | Jobs, build history and logs, archived JARs, test results, credentials (encrypted), installed plugins, Maven cache (`.m2`) | Build history is gone. Configuration, credentials and the job come back from `casc.yaml` + `.env` at the next start |
+| `cicd_sonarqube_db`         | `/var/lib/postgresql/data`    | **All SonarQube data**: projects, analyses, users, tokens, quality gates, webhooks, settings | Everything in SonarQube is gone – back it up |
+| `cicd_sonarqube_data`       | `/opt/sonarqube/data`         | SonarQube's search index                                              | Nothing – rebuilt from the database |
+| `cicd_sonarqube_extensions` | `/opt/sonarqube/extensions`   | Extra SonarQube plugins (none by default)                             | Reinstall extra plugins |
+| `cicd_sonarqube_logs`       | `/opt/sonarqube/logs`         | SonarQube log files                                                   | Only old logs |
+
+**What keeps your data, and what deletes it:**
+
+| Command / event                                         | Containers      | Volumes (data)   |
+|---------------------------------------------------------|-----------------|------------------|
+| `docker compose restart`, `stop`, `start`               | kept            | kept             |
+| `docker compose up -d`, `up -d --build`, `--force-recreate` | recreated if changed | kept     |
+| `docker compose down`                                   | removed         | kept             |
+| PC / EC2 reboot, Docker Desktop restart                 | started again (`restart: unless-stopped`) | kept |
+| `docker compose down -v`                                | removed         | **DELETED**      |
+| `docker volume rm cicd_...`, `docker volume prune -a`   | –               | **DELETED**      |
+
+Look at the volumes: `docker volume ls --filter name=cicd_` – their size: `docker system df -v`.
+
+---
+
+## Everyday commands
+
+Run them in the `cicd` folder. `<service>` is `jenkins`, `sonarqube` or `sonarqube-db`; without it, the command
+applies to all services.
+
+| Task                                                   | Command                                          |
+|--------------------------------------------------------|--------------------------------------------------|
+| Start everything / apply changes to `.env` or `docker-compose.yml` | `docker compose up -d`               |
+| Apply changes to `jenkins/` (Dockerfile, plugins, `casc.yaml`) | `docker compose up -d --build`           |
+| Apply a changed **secret** in `.env`                   | `docker compose up -d --force-recreate jenkins`  |
+| Status and health                                      | `docker compose ps`                              |
+| Logs (last 100 lines / follow live, Ctrl + C to stop)  | `docker compose logs --tail 100 <service>` / `docker compose logs -f <service>` |
+| Restart one service                                    | `docker compose restart <service>`               |
+| Stop everything (frees memory, keeps everything)       | `docker compose stop`                            |
+| Start again after `stop`                               | `docker compose start`                           |
+| Remove the containers (keeps the data)                 | `docker compose down`                            |
+| Open a shell in a container                            | `docker compose exec jenkins bash`               |
+| Restart Jenkins after the running builds finish        | http://localhost:8079/safeRestart                |
+| Deployed application: status / log                     | `docker ps --filter name=simple-spring-boot-app` / `docker logs simple-spring-boot-app` |
+| Free disk space (images no container uses) – **while the stack is running** | `docker image prune -a`     |
+
+**`restart` vs `up -d`:** `restart` only restarts the existing container – it does **not** apply changes to `.env`,
+`docker-compose.yml` or the image. To apply changes, use `up -d` (with `--build` or `--force-recreate` as in the table).
+
+**`docker compose down`** prints `Network cicd-network Resource is still in use` while the deployed application is
+running. That is expected: the application container uses the network, so Docker keeps it, and the next `up` reuses it.
+
+---
+
+## Changing settings and rotating tokens
+
+| What you change                                   | Where                              | Then run                                          |
+|---------------------------------------------------|------------------------------------|---------------------------------------------------|
+| Port, URL, repository, branch, user names         | `.env`                             | `docker compose up -d`                            |
+| A password or token (`JENKINS_ADMIN_PASSWORD`, `DOCKERHUB_TOKEN`, `SONAR_TOKEN`, `GITHUB_TOKEN`, `SONAR_WEBHOOK_SECRET`) | `.env` | `docker compose up -d --force-recreate jenkins` |
+| Jenkins settings, credentials, the job            | `jenkins/casc.yaml`                | `docker compose up -d --build`                    |
+| Plugins                                           | `jenkins/plugins.txt`              | `docker compose up -d --build`                    |
+| The pipeline stages                               | `Jenkinsfile` (project root)       | commit and push – the next build uses it          |
+| SonarQube settings, quality gates, webhook, users | SonarQube web UI                   | nothing – stored in the database                  |
+
+**Renewing a token** (Docker Hub, SonarQube, GitHub): create the new token, put it into `.env`, run
+`docker compose up -d --force-recreate jenkins`, then revoke the old token. Change the webhook secret in SonarQube and
+in `.env` at the same time.
+
+**Changing the Jenkins admin password:** in `.env` (`JENKINS_ADMIN_PASSWORD`) – a password changed in the web UI is
+reset at the next start.
+
+**Changing `SONARQUBE_DB_PASSWORD`:** PostgreSQL reads it only when the database is first created. To change it later:
+
+```powershell
+docker compose exec sonarqube-db psql -U sonar -d sonar -c "ALTER USER sonar PASSWORD 'the-new-password';"
+```
+
+Then put the new password into `.env` and run `docker compose up -d`.
+
+---
+
+## Backup and restore
+
+A backup contains the Jenkins data (`jenkins_home.tar.gz`) and the SonarQube database (`sonarqube_db.dump`), in
+`cicd/backups/<date_time>/` (time in UTC). Keep copies somewhere else as well – for example a network drive or S3.
+The folder contains your credentials: store it as carefully as `.env`.
+
+**Back up** (Jenkins is stopped for about a minute so that no build writes files during the backup):
+
+```powershell
+docker compose stop jenkins
+docker compose run --rm backup
+docker compose start jenkins
+```
+
+Expected output:
+
+```text
+Jenkins data -> backups/2026-11-03_0930/jenkins_home.tar.gz
+SonarQube database -> backups/2026-11-03_0930/sonarqube_db.dump
+Backup finished: cicd/backups/2026-11-03_0930 (time in UTC)
+```
+
+**Restore** – **replaces** the current Jenkins data and SonarQube database with the backup:
+
+```powershell
+docker compose stop jenkins sonarqube
+docker compose run --rm backup restore.sh 2026-11-03_0930
+docker compose start jenkins sonarqube
+```
+
+SonarQube then rebuilds its search index, which takes a minute or two longer than a normal start.
+
+**Restore on a new machine** (for example EC2): first `docker compose up -d` once so the volumes and the database
+exist, then the three commands above – see [Step E6](#step-e6--take-your-data-along-optional).
+
+> On Linux the backup files belong to `root` (they are written by a container). Delete old backups with `sudo rm -r backups/<folder>`.
+
+---
+
+## Upgrading
+
+Always [make a backup](#backup-and-restore) first.
+
+**Jenkins** – check https://www.jenkins.io/changelog-stable/ for the new LTS version, then change the version in two
+places: `FROM jenkins/jenkins:<version>-lts-jdk21` in `jenkins/Dockerfile` and `image: cicd-jenkins:<version>` in
+`docker-compose.yml`. Run `docker compose up -d --build`.
+
+**Plugins** – **Manage Jenkins** → **Plugins** → **Updates** lists newer versions. Copy the new version numbers into
+`jenkins/plugins.txt` and run `docker compose up -d --build`. (A plugin updated only in the web UI works, but isn't
+recorded in Git – the next machine built from the files wouldn't have it.) After a Jenkins upgrade, you can also write
+`latest` instead of a version, build, read the installed versions under **Installed plugins**, and pin them again.
+
+**SonarQube** – change the `sonarqube:` image tag in `docker-compose.yml`, run `docker compose up -d`. If
+http://localhost:9000 then says it is under maintenance, open http://localhost:9000/setup and start the database
+upgrade. Read the upgrade notes of the new version first: https://docs.sonarsource.com/sonarqube-community-build/
+
+**PostgreSQL 17.x** (bug and security fixes): `docker compose pull sonarqube-db` then `docker compose up -d`.
+A new **major** version (for example 18) can't read the old data files: back up, change both `postgres:17` tags
+(`sonarqube-db` and `backup`), `docker compose down`, `docker volume rm cicd_sonarqube_db`, `docker compose up -d`,
+then restore. Check the new image's notes first – PostgreSQL 18 images use a different data folder.
+
+**Docker CLI in the Jenkins image** – `docker:29.9.2-cli` in `jenkins/Dockerfile`. Update it when the host's Docker
+Engine gets a new major version (`docker version` → Server).
+
+---
+
+## Troubleshooting
+
+**Where to look:**
+
+1. `docker compose ps` – which service isn't `Up (healthy)`?
+2. `docker compose logs --tail 200 <service>` – the reason is usually in the last lines.
+3. Jenkins build page → **Console Output** – the **first** `ERROR` is usually the real cause.
+4. SonarQube → **Administration** → **Configuration** → **Webhooks** → **⋮** → **Show recent deliveries**.
+5. GitHub → repository **Settings** → **Webhooks** → **Recent Deliveries**.
+
+| Symptom / error message                                                         | Cause                                                              | Solution |
+|---------------------------------------------------------------------------------|--------------------------------------------------------------------|----------|
+| `Bind for 0.0.0.0:8079 failed: port is already allocated` (or `:9000`)          | The old Jenkins service or the old `sonarqube` container is still running | [Step 2](#step-2--retire-the-old-windows-setup) |
+| `required variable … is missing a value`                                        | A required value is empty in `.env`                                | Fill it in; `docker compose config --quiet` checks the file |
+| `environment variable "…" required by secret "…" is not set`                    | A line was deleted from `.env`                                     | Add it again (empty is fine) – compare with `.env.example` |
+| Jenkins: login fails; `docker compose logs jenkins` shows `Found unresolved variable 'jenkins_admin_password'` | `JENKINS_ADMIN_PASSWORD` is empty | Set it, then `docker compose up -d --force-recreate jenkins` |
+| Jenkins: login fails after changing the password in the web UI                  | `casc.yaml` set the `.env` password again at the restart           | Use the password from `.env`; change it there |
+| Jenkins doesn't start; log shows `ConfiguratorException` or `Invalid configuration elements` | Mistake in `casc.yaml` (often indentation – use spaces, never tabs) | Fix the line named in the message, `docker compose up -d --build` |
+| A setting changed in the Jenkins UI is back to the old value                    | `casc.yaml` is applied at every start                              | Change it in `casc.yaml` |
+| New `.env` token has no effect (`401`, `unauthorized`)                         | Compose doesn't recreate a container when only a secret changes    | `docker compose up -d --force-recreate jenkins` |
+| `permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock` | `DOCKER_GID` doesn't match the socket's group | Windows: `DOCKER_GID=0`. Ubuntu: `getent group docker \| cut -d: -f3` → `DOCKER_GID`, then `docker compose up -d` |
+| `./mvnw: Permission denied`                                                     | `mvnw` isn't executable in Git                                     | `git update-index --chmod=+x mvnw`, commit, push |
+| `/usr/bin/env: 'sh\r': No such file or directory`, `bad interpreter`, `$'\r': command not found` | A script has Windows line endings | Keep `.gitattributes`; to repair checked-out files: `git add --renormalize .` and commit |
+| `fatal: Couldn't find any revision to build`                                    | `GITHUB_BRANCH` doesn't exist                                      | Set the right branch in `.env` (`master`), `docker compose up -d` |
+| `remote: Repository not found` / `Authentication failed`                        | Private repository without (valid) token                           | `GITHUB_USERNAME` / `GITHUB_TOKEN` in `.env`, `--force-recreate jenkins` |
+| SonarQube Analysis: `HTTP 401` / `Not authorized`                               | `SONAR_TOKEN` empty, wrong or expired                              | [Step 7.4](#step-7--set-up-sonarqube-one-time) + [Step 8](#step-8--give-jenkins-the-sonarqube-token) |
+| SonarQube Analysis: `Connection refused` / `UnknownHostException: sonarqube`    | SonarQube is not running or still starting                         | `docker compose ps`; wait for `(healthy)`; `docker compose logs sonarqube` |
+| Creating the webhook: `Invalid URL: loopback, wildcard, link-local, site-local … are not allowed` | Local webhook validation is on                 | Switch off **Enable local webhooks validation** ([Step 7.2](#step-7--set-up-sonarqube-one-time)) |
+| Quality Gate waits, then `Timeout has been exceeded`                            | The webhook didn't arrive                                          | Webhook URL exactly `http://jenkins:8080/sonarqube-webhook/`; look at its **recent deliveries** |
+| Webhook delivery fails; Jenkins log shows `Invalid payload` / `signature`        | The secret in SonarQube and `SONAR_WEBHOOK_SECRET` differ          | Make them equal, `docker compose up -d --force-recreate jenkins` |
+| Links in the build log point to `http://sonarqube:9000/...`                     | SonarQube's **Server base URL** isn't set                          | [Step 7.2](#step-7--set-up-sonarqube-one-time) |
+| `Pipeline aborted due to quality gate failure: ERROR`                           | The code failed the quality gate – the gate is working             | Open the SonarQube dashboard, fix the listed conditions, push |
+| SonarQube stops; log: `max virtual memory areas vm.max_map_count [65530] is too low` | Kernel limit not set (Ubuntu)                                  | [Step E3](#step-e3--prepare-the-host-for-sonarqube-and-jenkins) |
+| A container stops with exit code **137**, or `OutOfMemoryError`                 | Not enough memory                                                  | Docker Desktop: [Step 1](#step-1--docker-desktop). EC2: a larger instance (8 GiB+) |
+| Smoke Test: `Could not resolve host: simple-spring-boot-app`                    | The application container isn't in `cicd-network`                 | The Deploy stage must use `--network "$DOCKER_NETWORK"`; check `DOCKER_NETWORK = 'cicd-network'` |
+| Smoke Test fails after all retries                                              | The application doesn't start                                      | `docker logs simple-spring-boot-app` |
+| `denied: requested access to the resource is denied` (push)                     | `DOCKER_IMAGE` isn't under your Docker Hub user, or the token is read-only | Fix `DOCKER_IMAGE` in the Jenkinsfile; **Read & Write** token |
+| GitHub delivery shows **200** but no build starts                               | The job never ran, or the push was to another branch               | Run the job once by hand ([Step 10](#step-10--run-the-pipeline)); push to `GITHUB_BRANCH` |
+| GitHub delivery fails (`failed to connect`, timeout)                            | PC: ngrok not running. EC2: security group closed, or the address changed | `docker compose --profile tunnel up -d` / check the security group and the Elastic IP |
+| ngrok log: the endpoint is already online                                       | Another ngrok (e.g. the old one on Windows) uses your domain       | Stop the other ngrok |
+| Jenkins warning "Building on the built-in node can be a security issue"         | Builds run on the Jenkins container itself                         | Expected in this setup – see [Security notes](#security-notes) |
+| Jenkins log: `entry for admin … duplicates one seen earlier for admin`          | Harmless message from creating the user through `casc.yaml`        | Nothing to do |
+| `docker compose down` prints `Network cicd-network … Resource is still in use` | The deployed application uses the network                          | Expected – the next `up` reuses it |
+| Git Bash: `cannot open C:/Program Files/Git/...` when running a command with a `/path` | Git Bash converts paths that start with `/`                   | Use PowerShell, or put `MSYS_NO_PATHCONV=1` in front of the command |
+
+---
+
+## Security notes
+
+- **Secrets** are only in `.env` (not in Git, `chmod 600` on Linux) and in Jenkins' encrypted credential store. Inside
+  the Jenkins container they are files in `/run/secrets/`, not environment variables, and builds see them only inside
+  `withCredentials`, masked as `****`. `docker logout` after every build removes the Docker Hub login.
+- **The Docker socket gives full control over the host.** Jenkins needs it to build and run images, which means that
+  whoever can change the `Jenkinsfile` or configure Jenkins can control the Docker host. Keep it that way only for a
+  trusted team: protect the `master` branch on GitHub, give Jenkins accounts only to the team, and never open Jenkins to
+  the internet without its login. The next step for a larger team is a separate **build agent** (a second machine or
+  container that runs the builds), so the Jenkins controller itself never runs build commands.
+- **Network:** the database has no published port and sits in an internal network; only Jenkins (8079), SonarQube
+  (9000) and the application (8080) are published. On EC2, the security group decides who reaches them.
+- **Webhooks:** the SonarQube → Jenkins webhook is signed (`SONAR_WEBHOOK_SECRET`); Jenkins rejects unsigned or forged
+  results.
+- **HTTPS:** plain HTTP is fine on your PC and through an SSH tunnel. Before Jenkins or SonarQube are used over the
+  internet with real accounts, put HTTPS in front of them ([Step E7](#step-e7--before-real-production-use)).
+- **Users:** Jenkins, SonarQube and the application all run as non-root users inside their containers.
+- **Exact versions** of every image and plugin: a rebuild never changes anything by surprise, and an upgrade is a
+  deliberate, reviewable change in Git.

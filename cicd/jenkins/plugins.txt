@@ -1,0 +1,22 @@
+# Jenkins plugins installed into the image: <plugin-id>:<version>.
+# Their dependencies (about 65 more plugins) are installed automatically.
+# Exact versions, so every rebuild gives the same Jenkins. To upgrade: see cicd/README.md ("Upgrading").
+
+# Jenkins Configuration as Code - applies casc.yaml at every start
+configuration-as-code:2144.ve8c697101488
+# Job DSL - creates the pipeline job described in casc.yaml
+job-dsl:3732.v9a_c49a_61a_313
+# Pipeline - runs the Jenkinsfile (pipeline { stages { ... } })
+workflow-aggregator:608.v67378e9d3db_1
+# Git - checkout scm
+git:5.11.0
+# GitHub - receives the GitHub webhook (/github-webhook/) and starts a build on every push
+github:1.47.0
+# Credentials Binding - withCredentials(...) for the Docker Hub token
+credentials-binding:728.v902a_273b_8947
+# JUnit - junit '...' shows the test results on the build page
+junit:1456.vdb_4425ca_0d4d
+# Pipeline Graph View - shows the stages as a diagram
+pipeline-graph-view:1053.v9df19e6ceed2
+# SonarQube Scanner - withSonarQubeEnv(...) and waitForQualityGate
+sonar:2.19.0

@@ -1,0 +1,180 @@
+# CI/CD environment for simple-spring-boot-app: Jenkins + SonarQube + SonarQube's PostgreSQL database.
+# The same file runs on Windows (Docker Desktop) and on Linux (for example Ubuntu on AWS EC2).
+#
+#   cd cicd
+#   cp .env.example .env            # then fill in the values (Windows PowerShell: Copy-Item .env.example .env)
+#   docker compose up -d --build    # start everything
+#
+# Every value that differs between machines, and every password or token, comes from .env.
+# Step-by-step guide: cicd/README.md
+
+# Project name: prefixes the volume names (cicd_jenkins_home, ...), so they are the same on every machine
+name: cicd
+
+services:
+
+  # ---------------------------------------------------------------- Jenkins: runs the pipeline (Jenkinsfile)
+  jenkins:
+    # Built from jenkins/Dockerfile: Jenkins LTS + Java 21 + Docker CLI + plugins + casc.yaml
+    build: ./jenkins
+    image: cicd-jenkins:2.580.2
+    restart: unless-stopped
+    ports:
+      # <port on this machine>:<port in the container>. Jenkins web UI: http://localhost:8079
+      - "${JENKINS_PORT:-8079}:8080"
+    environment:
+      # Read by jenkins/casc.yaml as ${NAME}. Not secret - passwords and tokens are passed as secrets below.
+      JENKINS_PUBLIC_URL: ${JENKINS_PUBLIC_URL:-http://localhost:8079/}
+      JENKINS_ADMIN_USER: ${JENKINS_ADMIN_USER:-admin}
+      GITHUB_REPO_URL: ${GITHUB_REPO_URL:?Set GITHUB_REPO_URL in .env}
+      GITHUB_BRANCH: ${GITHUB_BRANCH:-master}
+      GITHUB_USERNAME: ${GITHUB_USERNAME:-}
+      DOCKERHUB_USERNAME: ${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME in .env}
+    secrets:
+      # Mounted as files in /run/secrets/ - Jenkins reads them, but builds do not see them as variables
+      - jenkins_admin_password
+      - dockerhub_token
+      - github_token
+      - sonar_token
+      - sonar_webhook_secret
+    group_add:
+      # Group that owns the Docker socket, so the 'jenkins' user may run docker commands (see DOCKER_GID in .env)
+      - "${DOCKER_GID:-0}"
+    volumes:
+      # Jenkins data: jobs, build history, plugins, credentials, Maven download cache
+      - jenkins_home:/var/jenkins_home
+      # The host's Docker Engine: 'docker build/push/run' in the pipeline run on this machine's Docker
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - cicd
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/login > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # ---------------------------------------------------------------- SonarQube: code quality analysis
+  sonarqube:
+    image: sonarqube:26.10.0.133078-community
+    restart: unless-stopped
+    depends_on:
+      sonarqube-db:
+        condition: service_healthy   # start only when the database accepts connections
+    ports:
+      # SonarQube web UI: http://localhost:9000
+      - "${SONARQUBE_PORT:-9000}:9000"
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://sonarqube-db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: ${SONARQUBE_DB_PASSWORD:?Set SONARQUBE_DB_PASSWORD in .env}
+    volumes:
+      - sonarqube_data:/opt/sonarqube/data               # search index (rebuilt from the database if lost)
+      - sonarqube_extensions:/opt/sonarqube/extensions   # SonarQube plugins
+      - sonarqube_logs:/opt/sonarqube/logs
+    ulimits:
+      # SonarQube's search engine (Elasticsearch) needs many open files and threads
+      nofile:
+        soft: 131072
+        hard: 131072
+      nproc: 8192
+    networks:
+      - cicd
+      - sonarqube-db
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:9000/api/system/status | grep -q '\"status\":\"UP\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+
+  # ---------------------------------------------------------------- PostgreSQL: SonarQube's database
+  sonarqube-db:
+    # Major version 17 is fixed; 'docker compose pull' brings only bug and security fixes (17.x)
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sonar
+      # Used only when the database is created (first start). Changing it later: see README.md
+      POSTGRES_PASSWORD: ${SONARQUBE_DB_PASSWORD:?Set SONARQUBE_DB_PASSWORD in .env}
+      POSTGRES_DB: sonar
+    volumes:
+      - sonarqube_db:/var/lib/postgresql/data   # analyses, users, tokens, quality gates, webhooks
+    networks:
+      - sonarqube-db                            # reachable only by SonarQube (and the backup tool)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar -d sonar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------- Optional tools (start only when asked for)
+
+  # Public HTTPS address for the GitHub webhook while Jenkins runs on a PC (not needed on EC2).
+  # Start: docker compose --profile tunnel up -d     URL: docker compose logs ngrok
+  ngrok:
+    image: ngrok/ngrok:3.39.13-alpine
+    profiles: [tunnel]
+    restart: unless-stopped
+    command: ["http", "jenkins:8080", "--log", "stdout"]
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    depends_on:
+      - jenkins
+    networks:
+      - cicd
+
+  # Backup and restore of Jenkins and SonarQube data in cicd/backups/ (see backup/backup.sh and restore.sh).
+  # Backup: docker compose run --rm backup
+  backup:
+    # Same PostgreSQL version as the database, for pg_dump / pg_restore
+    image: postgres:17
+    profiles: [backup]
+    environment:
+      PGHOST: sonarqube-db
+      PGUSER: sonar
+      PGPASSWORD: ${SONARQUBE_DB_PASSWORD:?Set SONARQUBE_DB_PASSWORD in .env}
+      PGDATABASE: sonar
+    volumes:
+      - ./backup:/scripts:ro
+      - ./backups:/backups
+      - jenkins_home:/var/jenkins_home
+      - sonarqube_data:/sonarqube_data
+    depends_on:
+      sonarqube-db:
+        condition: service_healthy
+    networks:
+      - sonarqube-db
+    working_dir: /scripts
+    entrypoint: ["sh"]
+    # Default: backup.sh. Restore: docker compose run --rm backup restore.sh <folder name in backups/>
+    command: ["backup.sh"]
+
+# Docker secrets: created from the .env values, mounted as files in /run/secrets/<name>
+secrets:
+  jenkins_admin_password:
+    environment: JENKINS_ADMIN_PASSWORD
+  dockerhub_token:
+    environment: DOCKERHUB_TOKEN
+  github_token:
+    environment: GITHUB_TOKEN
+  sonar_token:
+    environment: SONAR_TOKEN
+  sonar_webhook_secret:
+    environment: SONAR_WEBHOOK_SECRET
+
+# Named volumes: data that survives 'docker compose down', restarts and image upgrades
+volumes:
+  jenkins_home:
+  sonarqube_data:
+  sonarqube_extensions:
+  sonarqube_logs:
+  sonarqube_db:
+
+networks:
+  # Jenkins, SonarQube and the deployed application. The fixed name is used by the Jenkinsfile (DOCKER_NETWORK).
+  cicd:
+    name: cicd-network
+  # SonarQube <-> its database only. 'internal' = no access to or from outside this network.
+  sonarqube-db:
+    internal: true

@@ -1,5 +1,9 @@
 # Jenkins CI/CD Guide – simple-spring-boot-app
 
+> **Replaced:** Jenkins and SonarQube now run as Docker containers with Docker Compose – follow
+> [cicd/README.md](cicd/README.md). This guide describes the previous setup (Jenkins as a Windows service); the
+> `Jenkinsfile` shown below is the old Windows version (`bat`), the one in the repository now uses Linux commands (`sh`).
+
 This guide sets up a Jenkins pipeline that, on every push to GitHub, automatically **builds, tests, packages, containerizes, publishes, and deploys** the application with Docker.
 
 It is written for **Jenkins running on Windows with Docker Desktop**. Follow the steps in order; each step ends with a way to check that it worked.
@@ -34,27 +38,35 @@ It is written for **Jenkins running on Windows with Docker Desktop**. Follow the
 ```text
  git push ──▶ GitHub ──webhook──▶ Jenkins
                                      │
-   Checkout ▶ Build ▶ Unit Tests ▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ──▶ Docker Hub
-                                                                                                 │
-                                        Smoke Test ◀ Deploy (docker run) ◀ Docker Pull ◀─────────┘
+   Checkout ▶ Build ▶ Unit Tests ▶ Integration Tests ▶ SonarQube Analysis ▶ Quality Gate ──┐
+                                                       (SonarQube: localhost:9000)         │ passed
+   ┌───────────────────────────────────────────────────────────────────────────────────────┘
+   └▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ──▶ Docker Hub
+                                                                    │
+               Smoke Test ◀ Deploy (docker run) ◀ Docker Pull ◀─────┘
 ```
 
-| # | Stage          | What happens                                                         | Command (in the `Jenkinsfile`)                               |
-|---|----------------|----------------------------------------------------------------------|--------------------------------------------------------------|
-| 1 | Checkout       | Downloads the latest code from GitHub                                | `checkout scm`                                               |
-| 2 | Build          | Compiles the code                                                    | `mvnw.cmd -B clean compile`                                  |
-| 3 | Unit Tests     | Runs the tests and publishes the results                             | `mvnw.cmd -B test`                                           |
-| 4 | Package JAR    | Builds `simple-spring-boot-app-v<N>.jar` and archives it             | `mvnw.cmd -B package -DskipTests -DbuildNumber=<N>`          |
-| 5 | Docker Build   | Builds a Docker image from the JAR, tagged `v<N>` and `latest`       | `docker build -t <image>:v<N> -t <image>:latest .`           |
-| 6 | Docker Login   | Logs in to Docker Hub with the token stored in Jenkins               | `docker login --password-stdin`                              |
-| 7 | Docker Push    | Uploads both tags to Docker Hub                                      | `docker push`                                                |
-| 8 | Docker Pull    | Deletes the local copy and downloads the image from Docker Hub       | `docker rmi` + `docker pull`                                 |
-| 9 | Deploy         | Replaces the old container with the new version                      | `docker rm -f` + `docker run -d -p 8080:8080 ...`            |
-| 10 | Smoke Test    | Calls the API to prove the new container works                       | `curl http://localhost:8080/api/hello`                       |
+| #  | Stage             | What happens                                                         | Command (in the `Jenkinsfile`)                               |
+|----|-------------------|----------------------------------------------------------------------|--------------------------------------------------------------|
+| 1  | Checkout          | Downloads the latest code from GitHub                                | `checkout scm`                                               |
+| 2  | Build             | Compiles the code                                                    | `mvnw.cmd -B clean compile`                                  |
+| 3  | Unit Tests        | Runs the unit tests and publishes the results                        | `mvnw.cmd -B test`                                           |
+| 4  | Integration Tests | Starts the whole application on a random port, tests it over HTTP, and publishes the results | `mvnw.cmd -B failsafe:integration-test failsafe:verify` |
+| 5  | SonarQube Analysis | Sends the code, test results and coverage to SonarQube              | `withSonarQubeEnv('SonarQube') { mvnw.cmd -B sonar:sonar }`  |
+| 6  | Quality Gate      | Waits for SonarQube's verdict; stops the build if the quality gate failed | `waitForQualityGate abortPipeline: true`                |
+| 7  | Package JAR       | Builds `simple-spring-boot-app-v<N>.jar` and archives it             | `mvnw.cmd -B package -DskipTests -DbuildNumber=<N>`          |
+| 8  | Docker Build      | Builds a Docker image from the JAR, tagged `v<N>` and `latest`       | `docker build -t <image>:v<N> -t <image>:latest .`           |
+| 9  | Docker Login      | Logs in to Docker Hub with the token stored in Jenkins               | `docker login --password-stdin`                              |
+| 10 | Docker Push       | Uploads both tags to Docker Hub                                      | `docker push`                                                |
+| 11 | Docker Pull       | Deletes the local copy and downloads the image from Docker Hub       | `docker rmi` + `docker pull`                                 |
+| 12 | Deploy            | Replaces the old container with the new version                      | `docker rm -f` + `docker run -d -p 8080:8080 ...`            |
+| 13 | Smoke Test        | Calls the API to prove the new container works                       | `curl http://localhost:8080/api/hello`                       |
 
 `<N>` is the **Jenkins build number**, so build #42 produces `simple-spring-boot-app-v42.jar` and the image tag `v42`.
 
 If any stage fails, the pipeline stops there. Deploy is near the end, so **a broken build never replaces the running application**.
+
+Stages 5 and 6 need SonarQube running on your PC – install and connect it with [SONARQUBE-GUIDE.md](SONARQUBE-GUIDE.md) (Tamil: [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md)).
 
 ---
 
@@ -69,8 +81,9 @@ If any stage fails, the pipeline stops there. Deploy is near the end, so **a bro
 | Docker Desktop | 29.x, Linux containers, installed for your Windows user               | Building and running images       |
 | Git            | Git for Windows, installed for your Windows user                      | Pushing code; Jenkins checkout    |
 | curl           | Built into Windows 10/11                                               | Smoke test                        |
+| SonarQube      | Community Build 26.10, Docker container `sonarqube`, http://localhost:9000 | Code analysis and quality gate |
 
-> Jenkins uses port **8079** because the application itself uses **8080**.
+> Jenkins uses port **8079** because the application itself uses **8080**. SonarQube uses **9000**.
 
 ---
 
@@ -173,6 +186,7 @@ The pipeline uses plain `mvnw.cmd` and `docker` commands, so it needs only a few
 | **Credentials Binding**                     | `withCredentials` – uses the Docker Hub token safely             |
 | **JUnit**                                   | `junit` – shows test results on the build page                   |
 | **Pipeline Graph View** (or Pipeline: Stage View) | Shows the stages as a diagram (turn it on below)           |
+| **SonarQube Scanner**                       | `withSonarQubeEnv` and `waitForQualityGate` – **not** part of the suggested plugins; set up in [SONARQUBE-GUIDE.md Step 5](SONARQUBE-GUIDE.md#step-5--install-the-sonarqube-scanner-plugin-in-jenkins) |
 
 **How to check / install:**
 
@@ -319,6 +333,8 @@ Secrets live in Jenkins, **never in the Jenkinsfile or in Git**.
 
 The **ID must match exactly** – the Jenkinsfile looks up `dockerhub-credentials` by this ID.
 
+The SonarQube token is a third credential (**Secret text**, ID `sonarqube-token`) – see [SONARQUBE-GUIDE.md Step 6](SONARQUBE-GUIDE.md#step-6--store-the-token-in-jenkins).
+
 **Check:** both credentials appear in the list (the secret itself is never shown again).
 
 ---
@@ -339,7 +355,7 @@ The **ID must match exactly** – the Jenkinsfile looks up `dockerhub-credential
 
 The first build takes a few minutes (it downloads Maven, the dependencies, and the Java base image). The first build must be started manually – afterwards the webhook starts builds automatically.
 
-**Check:** the build turns green, and all ten stages are shown as passed. See [Step 11](#step-11--check-every-stage) for what to look for in each stage.
+**Check:** the build turns green, and all thirteen stages are shown as passed. See [Step 11](#step-11--check-every-stage) for what to look for in each stage.
 
 ---
 
@@ -394,7 +410,10 @@ Open the build page → **Pipeline Overview** (or **Stage View**) to see the sta
 |--------------|-----------------------------------------------------------------------------------------|---------------------------------------------------------------------|
 | Checkout     | `Checking out Revision 1a2b3c… (refs/remotes/origin/main)`                             | The commit matches the latest one on GitHub                         |
 | Build        | `BUILD SUCCESS`                                                                        | –                                                                   |
-| Unit Tests   | `Tests run: 1, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`                 | Build page → **Test Result**                                        |
+| Unit Tests   | `Tests run: 5, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS`                 | Build page → **Test Result**                                        |
+| Integration Tests | `Tomcat started on port <random number>`, then `Tests run: 8, Failures: 0, Errors: 0, Skipped: 0` and `BUILD SUCCESS` | **Test Result** also lists `DemoApplicationIT` (13 tests in total) |
+| SonarQube Analysis | `ANALYSIS SUCCESSFUL, you can find the results at: http://localhost:9000/dashboard?id=simple-spring-boot-app` | The SonarQube dashboard shows the new analysis                     |
+| Quality Gate | `SonarQube task '…' completed. Quality gate is 'OK'`                                     | Build page → **SonarQube Quality Gate** badge                       |
 | Package JAR  | `Building jar: …\target\simple-spring-boot-app-v<N>.jar`                               | Build page → **Build Artifacts** has the JAR                        |
 | Docker Build | `naming to docker.io/<user>/simple-spring-boot-app:v<N> done`                          | `docker images <user>/simple-spring-boot-app`                       |
 | Docker Login | `Login Succeeded`                                                                      | –                                                                   |
@@ -432,7 +451,7 @@ All files are in the project root (next to `pom.xml`).
 | `Dockerfile`    | How to build the Docker image from the JAR                                       |
 | `.dockerignore` | Which files Docker may read while building (only the JAR)                        |
 | `.gitignore`    | Files Git must not commit (`target/`, IDE files)                                 |
-| `pom.xml`       | The `buildNumber` property (default `0`) puts the build number in the JAR name   |
+| `pom.xml`       | The `buildNumber` property (default `0`) puts the build number in the JAR name; `maven-failsafe-plugin` runs the integration tests; JaCoCo measures coverage and `sonar-maven-plugin` runs the SonarQube analysis |
 | `mvnw.cmd`      | Maven Wrapper – downloads and runs the correct Maven version                    |
 
 ### Jenkinsfile (complete)
@@ -440,12 +459,15 @@ All files are in the project root (next to `pom.xml`).
 ```groovy
 // CI/CD pipeline for simple-spring-boot-app (Jenkins on Windows + Docker Desktop).
 //
-// Checkout -> Build -> Unit Tests -> Package JAR -> Docker Build -> Docker Login
-//          -> Docker Push -> Docker Pull -> Deploy -> Smoke Test
+// Checkout -> Build -> Unit Tests -> Integration Tests -> SonarQube Analysis -> Quality Gate
+//          -> Package JAR -> Docker Build -> Docker Login -> Docker Push -> Docker Pull
+//          -> Deploy -> Smoke Test
 //
 // Before the first run: set DOCKER_IMAGE below and create the Jenkins credential
 // 'dockerhub-credentials'. Step-by-step setup: CICD-GUIDE.md
 // (Tamil: JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md)
+// SonarQube setup (server 'SonarQube' in Manage Jenkins -> System): SONARQUBE-GUIDE.md
+// (Tamil: SONARQUBE_GUIDE_TAMIL.md)
 pipeline {
     agent any
 
@@ -488,6 +510,40 @@ pipeline {
                 always {
                     // Show the test results on the build page (also when tests fail)
                     junit 'target/surefire-reports/*.xml'
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                // Runs only the integration tests (classes ending in IT, e.g. DemoApplicationIT): starts the
+                // whole application on a random free port and calls it over HTTP. The stages above already
+                // compiled the code, so the unit tests do not run again and no JAR is built here.
+                bat '.\\mvnw.cmd -B failsafe:integration-test failsafe:verify'
+            }
+            post {
+                always {
+                    // TEST-*.xml only: failsafe-summary.xml in the same folder is not a JUnit report
+                    junit 'target/failsafe-reports/TEST-*.xml'
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                // Sends the code, test results and coverage (from the stages above) to SonarQube.
+                // 'SonarQube' = server name in Manage Jenkins -> System -> SonarQube servers (gives URL + token)
+                withSonarQubeEnv('SonarQube') {
+                    bat '.\\mvnw.cmd -B sonar:sonar'
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                // Waits for SonarQube's verdict (sent back by its webhook); a failed gate stops the build here
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
@@ -566,6 +622,9 @@ pipeline {
 - **`environment`** – values used by several stages, defined once. Change `DOCKER_IMAGE` (your Docker Hub user) and, if needed, `HOST_PORT`.
 - **`'.\\mvnw.cmd'`** – Groovy needs the backslash written twice; Windows receives `.\mvnw.cmd` ("run `mvnw.cmd` from the project folder").
 - **Single quotes** around `bat` commands – Jenkins passes the text unchanged and Windows replaces `%NAME%` with the variable's value.
+- **`failsafe:integration-test failsafe:verify`** in the Integration Tests stage – runs only the test classes ending in `IT`; `verify` fails the stage if one of them failed. Running these two goals directly (instead of `mvnw verify`) means the unit tests don't run twice and no second JAR lands in `target`, which would break the Docker Build. The application starts on a random free port, so it doesn't clash with the deployed container on 8080.
+- **`TEST-*.xml`** in the Integration Tests `junit` step – the folder also contains `failsafe-summary.xml`, which is not a test report.
+- **`withSonarQubeEnv('SonarQube')`** – gives the scanner the SonarQube URL and token configured in Jenkins, so the token is never in the Jenkinsfile. **`waitForQualityGate abortPipeline: true`** waits for SonarQube's webhook and fails the build if the quality gate failed, before anything is packaged or deployed. Details: [SONARQUBE-GUIDE.md](SONARQUBE-GUIDE.md#the-project-files-explained).
 - **`--retry-all-errors`** in the Smoke Test – the application needs a few seconds to start; curl keeps trying for about 30 seconds before failing.
 - **`--restart unless-stopped`** – Docker restarts the container automatically, for example after a reboot, until you remove it.
 - **No `docker logout`** – Jenkins runs as your Windows account and shares your Docker login, so logging out would also sign you out of Docker Desktop. On a dedicated build server, add `post { always { bat 'docker logout' } }`.
@@ -685,8 +744,11 @@ docker rm -f simple-spring-boot-app-local
 | `Couldn't find any revision to build`                                                             | Branch name doesn't match                                                | Branch Specifier `*/main` (or `*/master` if that is your branch)                                 |
 | `'.\mvnw.cmd' is not recognized`                                                                  | `mvnw.cmd` is not in the repository root                                 | The repository root must contain `pom.xml` and `mvnw.cmd` ([2.3](#23-push-the-code))             |
 | `JAVA_HOME environment variable is not defined correctly` / `release version 21 not supported`    | Jenkins doesn't see JDK 21                                               | Set the **system** `JAVA_HOME` to JDK 21, restart the Jenkins service ([Step 5](#step-5--java-and-maven)) |
-| `Tests run: 1, Failures: 1` (Unit Tests stage red)                                                | A test failed                                                            | **Test Result** shows which and why; fix the code and push again                                 |
+| `Tests run: 5, Failures: 1` (Unit Tests stage red)                                                | A unit test failed                                                       | **Test Result** shows which and why; fix the code and push again                                 |
+| `Tests run: 8, Failures: 1` (Integration Tests stage red)                                         | An integration test failed: an endpoint gives the wrong answer, or the application doesn't start (`Failed to load ApplicationContext`) | **Test Result** → `DemoApplicationIT` shows which and why; reproduce it locally with `.\mvnw.cmd clean verify` |
+| `No test report files were found. Configuration error?` (Integration Tests stage)                 | No test class ends in `IT`, so no integration test ran                   | Integration test class names must end in `IT` (e.g. `DemoApplicationIT`) and be in `src/test/java` |
 | `No such DSL method 'junit'` / `'withCredentials'`                                                | Plugin missing                                                           | Install **JUnit** / **Credentials Binding** ([Step 4](#step-4--install-the-jenkins-plugins))     |
+| SonarQube Analysis or Quality Gate stage red (`withSonarQubeEnv`, `401 Unauthorized`, `Pipeline aborted due to quality gate failure`, timeout) | SonarQube not running, not connected, or the code failed the quality gate | [SONARQUBE-GUIDE.md → Troubleshooting](SONARQUBE-GUIDE.md#troubleshooting) |
 | `COPY failed: no source files were specified` / `"/target": not found`                            | No JAR in `target`                                                       | The Package JAR stage must succeed; don't change `.dockerignore`                                 |
 | `When using COPY with more than one source file, the destination must be a directory`             | Several JARs in `target`                                                 | Run a `clean` build (the pipeline does); locally use `.\mvnw.cmd clean package`                  |
 | `unauthorized: incorrect username or password`                                                    | Wrong Docker Hub username or token in `dockerhub-credentials`, or token revoked | Update the credential ([Step 8](#step-8--store-the-credentials-in-jenkins))                |

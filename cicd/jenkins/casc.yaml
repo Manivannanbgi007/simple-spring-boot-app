@@ -1,0 +1,113 @@
+# Jenkins Configuration as Code (JCasC) - the complete Jenkins configuration.
+#
+# Jenkins applies this file on every start, so this file (not the web UI) is the place to change settings.
+# A change made only in the web UI is overwritten at the next restart.
+#
+# ${NAME} is replaced when Jenkins starts:
+#   - UPPER_CASE names: environment variables set in docker-compose.yml (values from cicd/.env)
+#   - lower_case names: Docker secrets, read from the file /run/secrets/<name> (values from cicd/.env)
+#   - ${name:-}        : empty if the value is not set (for example no GitHub token for a public repository)
+#
+# After a change: docker compose up -d --build
+
+jenkins:
+  systemMessage: "CI/CD for simple-spring-boot-app. This Jenkins is configured by cicd/jenkins/casc.yaml - changes made in the web UI are lost at the next restart."
+  # Builds run on Jenkins itself; 2 builds can run at the same time
+  numExecutors: 2
+
+  # Log-in with a Jenkins user account; nobody can sign up on their own
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_USER}"
+          password: "${jenkins_admin_password}"
+
+  # Logged-in users can do everything; anonymous visitors see nothing (only the login page)
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+unclassified:
+  # The address people use to open Jenkins (used for links, for example in GitHub and SonarQube)
+  location:
+    url: "${JENKINS_PUBLIC_URL}"
+
+  # SonarQube server used by withSonarQubeEnv('SonarQube') in the Jenkinsfile.
+  # 'sonarqube' is the service name in docker-compose.yml - containers in the same network reach each other by name.
+  sonarGlobalConfiguration:
+    buildWrapperEnabled: true
+    installations:
+      - name: "SonarQube"
+        serverUrl: "http://sonarqube:9000"
+        credentialsId: "sonarqube-token"
+        # Jenkins accepts a quality gate result only if SonarQube signed it with this secret
+        webhookSecretId: "sonarqube-webhook-secret"
+
+# Pipeline Graph View (Manage Jenkins -> Appearance): the stages as a diagram on the job page and on every
+# build page, with the name and duration of each stage
+appearance:
+  pipelineGraphView:
+    showGraphOnJobPage: true
+    showGraphOnBuildPage: true
+    showStageNames: true
+    showStageDurations: true
+
+# Credentials (stored encrypted in Jenkins, shown as **** in build logs). The IDs are used by the Jenkinsfile.
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - usernamePassword:
+              scope: GLOBAL
+              id: "dockerhub-credentials"
+              description: "Docker Hub access token (cicd/.env: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN)"
+              username: "${DOCKERHUB_USERNAME}"
+              password: "${dockerhub_token:-}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "github-credentials"
+              description: "GitHub token, needed only for a private repository (cicd/.env: GITHUB_USERNAME, GITHUB_TOKEN)"
+              username: "${GITHUB_USERNAME:-git}"
+              password: "${github_token:-}"
+          - string:
+              scope: GLOBAL
+              id: "sonarqube-token"
+              description: "SonarQube token (cicd/.env: SONAR_TOKEN)"
+              secret: "${sonar_token:-}"
+          - string:
+              scope: GLOBAL
+              id: "sonarqube-webhook-secret"
+              description: "Secret of the SonarQube webhook (cicd/.env: SONAR_WEBHOOK_SECRET)"
+              secret: "${sonar_webhook_secret:-}"
+
+# The pipeline job (Job DSL). It runs the Jenkinsfile from the GitHub repository and starts on every push.
+jobs:
+  - script: |
+      pipelineJob('simple-spring-boot-app') {
+        description('Build, test, analyse (SonarQube), package and deploy simple-spring-boot-app. Defined in cicd/jenkins/casc.yaml.')
+        properties {
+          pipelineTriggers {
+            triggers {
+              // "GitHub hook trigger for GITScm polling": a GitHub webhook starts a build on every push
+              githubPush()
+            }
+          }
+        }
+        definition {
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('${GITHUB_REPO_URL}')
+                  credentials('github-credentials')
+                }
+                branch('*/${GITHUB_BRANCH}')
+              }
+            }
+            scriptPath('Jenkinsfile')
+            // Read only the Jenkinsfile first, without cloning the whole repository
+            lightweight(true)
+          }
+        }
+      }

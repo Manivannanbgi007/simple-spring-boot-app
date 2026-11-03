@@ -1,6 +1,7 @@
 package com.example.demo.controller;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -24,5 +25,19 @@ class HelloControllerTest {
         mockMvc.perform(get("/api/hello"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("Hello! Spring Boot application is running successfully."));
+    }
+
+    @Test
+    void newHello_returnsOkWithNewMessage() throws Exception {
+        mockMvc.perform(get("/api/new"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("NEW SPRING BOOT APPLICATION!"));
+    }
+
+    @Test
+    void postToHello_returnsMethodNotAllowed() throws Exception {
+        // The endpoints are mapped with @GetMapping, so other HTTP methods are rejected
+        mockMvc.perform(post("/api/hello"))
+                .andExpect(status().isMethodNotAllowed());
     }
 }

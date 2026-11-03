@@ -25,6 +25,8 @@
             Jenkins overrides it with its own build number: mvnw package -DbuildNumber=${BUILD_NUMBER}
         -->
         <buildNumber>0</buildNumber>
+        <!-- Project key in SonarQube (http://localhost:9000/dashboard?id=simple-spring-boot-app) -->
+        <sonar.projectKey>simple-spring-boot-app</sonar.projectKey>
     </properties>
 
     <dependencies>
@@ -52,11 +54,62 @@
         <!-- Name of the packaged JAR: simple-spring-boot-app-v0.jar locally, -v42.jar for Jenkins build #42 -->
         <finalName>${project.artifactId}-v${buildNumber}</finalName>
 
+        <pluginManagement>
+            <plugins>
+                <!--
+                    SonarQube scanner: 'mvnw sonar:sonar' sends the code, test results and coverage to SonarQube.
+                    Listed here only to fix its version - it does not run during a normal build.
+                -->
+                <plugin>
+                    <groupId>org.sonarsource.scanner.maven</groupId>
+                    <artifactId>sonar-maven-plugin</artifactId>
+                    <version>5.8.0.7211</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
+
         <plugins>
             <!-- Packages the application as an executable JAR and provides 'mvn spring-boot:run' -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!--
+                Runs the integration tests (classes ending in IT, e.g. DemoApplicationIT) during 'mvnw verify'.
+                Unit tests (classes ending in Test) still run with 'mvnw test'.
+                The Spring Boot parent already configures the plugin's goals and version.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+            </plugin>
+
+            <!--
+                JaCoCo measures which lines of code the unit tests run (code coverage).
+                'mvnw test' writes target/site/jacoco/jacoco.xml (read by SonarQube) and index.html (open in a browser).
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.15</version>
+                <executions>
+                    <!-- Attaches the coverage agent to the unit tests -->
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <!-- Writes the coverage report right after the unit tests -->
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

@@ -1,0 +1,6 @@
+# Passwords and tokens - never commit
+.env
+LOCAL-CREDENTIALS.md
+
+# Backups contain the Jenkins credentials and the SonarQube database
+backups/
