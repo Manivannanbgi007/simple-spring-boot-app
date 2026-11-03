@@ -256,7 +256,7 @@ Plugin என்பது Jenkins-க்குப் புதிய திற�
 | **GitHub** | GitHub webhook-ஐ ஏற்று build தொடங்க | Triggers | பிரிவு [7.6](#section-7-6) |
 | **Credentials** மற்றும் **Credentials Binding** | Token / password-ஐ பாதுகாப்பாகச் சேமித்து `withCredentials` மூலம் பயன்படுத்த | Docker Login stage | பிரிவு [6.4](#section-6-4) |
 | **JUnit** | Unit test முடிவுகளை build page-ல் காட்ட | Unit Tests stage | தேவையில்லை |
-| **Pipeline Graph View** (அல்லது பழைய **Pipeline: Stage View**) | Stages-ஐ படமாகக் காட்ட | Build page | தேவையில்லை |
+| **Pipeline Graph View** (அல்லது பழைய **Pipeline: Stage View**) | Stages-ஐ படமாகக் காட்ட | Job page, Build page | பிரிவு [2.4](#section-2-4) (Appearance) |
 
 **Maven, Docker, Docker Hub-க்குத் தனி plugin தேவையா?**
 
@@ -285,6 +285,32 @@ Plugin என்பது Jenkins-க்குப் புதிய திற�
 ```
 
 > 🏢 **அலுவலக network (proxy) பயன்படுத்தினால்:** plugins download ஆகவில்லை என்றால் **Manage Jenkins** → **Plugins** → **Advanced settings** → **HTTP Proxy Configuration**-ல் proxy server, port கொடுத்து **Submit** செய்யுங்கள் (விவரங்களை உங்கள் IT குழுவிடம் கேளுங்கள்).
+
+<a id="section-2-4"></a>
+### 2.4 Pipeline Graph View-ஐ job page-ல் காட்டுதல்
+
+**Pipeline Graph View** நிறுவியிருந்தாலும், அது job page-ல் தானாகத் தெரியாது — இந்த setting இயல்பாக (default) off-ல் இருக்கும். அதுவரை job page-ல் பழைய **Stage View** அட்டவணை மட்டுமே தெரியும்.
+
+1. **Manage Jenkins** → **Appearance**.
+2. **Pipeline Stages** பகுதியில் **Show pipeline stages on job page**-ஐ tick செய்யுங்கள் (விருப்பம்: **Show stage names by default**, **Show stage durations by default**-ஐயும் tick செய்யலாம்).
+3. **Pipeline Graph** பகுதியில் **Show pipeline graph on build page**-ஐ tick செய்யுங்கள்.
+4. **Save** — restart தேவையில்லை.
+
+```text
+┌─ Manage Jenkins › Appearance ────────────────────────────────┐
+│  Pipeline Stages                                             │
+│  [✓] Show pipeline stages on job page                        │
+│  [✓] Show stage names by default                             │
+│  [✓] Show stage durations by default                         │
+│  Pipeline Graph                                              │
+│  [✓] Show pipeline graph on build page                       │
+│                                                     [ Save ] │
+└──────────────────────────────────────────────────────────────┘
+```
+
+முதல் build-க்குப் பிறகு job page-ல் புதிய **Stages** card தெரியும்.
+
+> **பழைய Stage View அட்டவணையை நீக்க (விருப்பம்):** **Manage Jenkins** → **Plugins** → **Installed plugins** → `Pipeline: Stage View` → toggle-ஐ off செய்யுங்கள் → Jenkins restart (http://localhost:8079/safeRestart). Toggle சாம்பல் நிறத்தில் (greyed out) இருந்தால், வேறு plugin அதைச் சார்ந்துள்ளது — அப்படியே விட்டுவிடுங்கள்; job page-ல் இரண்டும் தெரியும்.
 
 ✅ **சரிபார்ப்பு:** மேலே உள்ள பட்டியலின் plugins அனைத்தும் **Installed plugins**-ல் உள்ளன.
 

@@ -23,4 +23,9 @@ public class HelloController {
     public Map<String, String> sayHello() {
         return Map.of("message", SUCCESS_MESSAGE);
     }
+
+    @GetMapping("/new")
+    public Map<String, String> newHello() {
+        return Map.of("message", "NEW");
+    }
 }

@@ -172,7 +172,7 @@ The pipeline uses plain `mvnw.cmd` and `docker` commands, so it needs only a few
 | **GitHub**                                  | Receives GitHub webhooks ("GitHub hook trigger for GITScm polling") |
 | **Credentials Binding**                     | `withCredentials` – uses the Docker Hub token safely             |
 | **JUnit**                                   | `junit` – shows test results on the build page                   |
-| **Pipeline Graph View** (or Pipeline: Stage View) | Shows the stages as a diagram                              |
+| **Pipeline Graph View** (or Pipeline: Stage View) | Shows the stages as a diagram (turn it on below)           |
 
 **How to check / install:**
 
@@ -180,6 +180,15 @@ The pipeline uses plain `mvnw.cmd` and `docker` commands, so it needs only a few
 2. If one is missing: **Available plugins** → search → tick it → **Install** → tick **Restart Jenkins when installation is complete** if asked.
 
 > Not needed: the "Docker Pipeline" and "Maven Integration" plugins. Plain commands are easier to read, and you can run exactly the same commands in your own terminal.
+
+**Show Pipeline Graph View on the job page:** the plugin doesn't appear on the job page until you turn it on – until then the job page shows only the old **Stage View** table.
+
+1. **Manage Jenkins** → **Appearance**.
+2. Under **Pipeline Stages**, tick **Show pipeline stages on job page** (optional: also tick **Show stage names by default** and **Show stage durations by default**).
+3. Under **Pipeline Graph**, tick **Show pipeline graph on build page**.
+4. Click **Save** (no restart needed).
+
+Optional – remove the old Stage View table: **Manage Jenkins** → **Plugins** → **Installed plugins** → search **Pipeline: Stage View** → switch it off → restart Jenkins (http://localhost:8079/safeRestart). If the switch is greyed out, another plugin needs it – leave it on; the job page then shows both views.
 
 ---
 
