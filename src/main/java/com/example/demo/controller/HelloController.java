@@ -26,6 +26,6 @@ public class HelloController {
 
     @GetMapping("/new")
     public Map<String, String> newHello() {
-        return Map.of("message", "NEW");
+        return Map.of("message", "NEW SPRING BOOT APPLICATION!");
     }
 }
