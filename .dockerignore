@@ -1,0 +1,4 @@
+# Send only the built JAR to Docker. This keeps "docker build" fast and keeps
+# source code, Git history, and IDE files out of the image.
+*
+!target/*.jar

@@ -6,3 +6,10 @@ server:
   # Port the embedded web server listens on.
   # If 8080 is already in use, change this value (for example, to 8081).
   port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Expose only the health endpoint over HTTP: GET /actuator/health -> {"status":"UP"}
+        include: health

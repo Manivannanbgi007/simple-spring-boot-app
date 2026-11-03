@@ -34,7 +34,12 @@ It is intentionally small: one application class, one controller, one configurat
 ```text
 simple-spring-boot-app/
 ├── .mvn/wrapper/maven-wrapper.properties    # Maven Wrapper settings (which Maven version to use)
-├── Jenkinsfile                              # Jenkins pipeline: test, build, and archive the JAR
+├── .dockerignore                            # Files Docker may read when building the image (only the JAR)
+├── .gitignore                               # Files Git must not commit (target/, IDE files)
+├── CICD-GUIDE.md                            # Step-by-step Jenkins CI/CD setup guide
+├── Dockerfile                               # Builds the Docker image from the JAR
+├── Jenkinsfile                              # Jenkins CI/CD pipeline: build, test, Docker, deploy
+├── JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md  # Jenkins setup and pipeline guide in Tamil
 ├── mvnw                                     # Maven Wrapper script (macOS / Linux)
 ├── mvnw.cmd                                 # Maven Wrapper script (Windows)
 ├── pom.xml                                  # Maven build file: Java version, dependencies, plugins
@@ -64,7 +69,8 @@ simple-spring-boot-app/
 - **`HelloController.java`** – `@RestController` marks it as a REST controller whose return values are written directly as the HTTP response body. `@RequestMapping("/api")` + `@GetMapping("/hello")` map the method to `GET /api/hello`. The returned `Map` is converted to JSON automatically.
 - **`application.yml`** – External configuration in YAML format (indentation shows the nesting, so `server:` → `port:` means `server.port`). `server.port` sets the HTTP port, so it can be changed without touching Java code. Use spaces for indentation, never tabs.
 - **`HelloControllerTest.java`** – Uses `@WebMvcTest` to load only the web layer and `MockMvc` to send a fake HTTP request, then checks the status code is `200` and the JSON `message` is correct.
-- **`Jenkinsfile`** – The Jenkins pipeline. Runs the tests, builds the JAR with Jenkins' build number, and archives it (see [Jenkins Pipeline](#jenkins-pipeline)).
+- **`Jenkinsfile`** – The Jenkins CI/CD pipeline: builds and tests the code, creates the JAR and Docker image, pushes the image to Docker Hub, and deploys it as a container (see [Jenkins CI/CD Pipeline](#jenkins-cicd-pipeline)).
+- **`Dockerfile`** – Builds a Docker image that runs the JAR on a Java 21 runtime as a non-root user. `.dockerignore` makes Docker read only the JAR.
 
 ## Maven Build Commands
 
@@ -97,45 +103,27 @@ The JAR name contains a build number, set by the `buildNumber` property in `pom.
 | Where the JAR is built | Command                                                  | JAR created                             |
 |------------------------|----------------------------------------------------------|-----------------------------------------|
 | Your computer          | `.\mvnw.cmd clean package`                               | `target/simple-spring-boot-app-v0.jar`  |
-| Jenkins build #42      | `mvnw clean package -DbuildNumber=42` (run by Jenkinsfile) | `target/simple-spring-boot-app-v42.jar` |
+| Jenkins build #42      | `mvnw package -DbuildNumber=42` (run by the Jenkinsfile) | `target/simple-spring-boot-app-v42.jar` |
 
-- **Jenkins owns the build number.** Every Jenkins build gets a unique, increasing number (`BUILD_NUMBER`), which the `Jenkinsfile` passes to Maven. So `v42` always means "Jenkins build #42", and you can look up its log, test results, and Git commit in Jenkins.
+- **Jenkins owns the build number.** Every Jenkins build gets a unique, increasing number (`BUILD_NUMBER`), which the `Jenkinsfile` passes to Maven. So `v42` always means "Jenkins build #42", and you can look up its log, test results, and Git commit in Jenkins. The Docker image of that build is tagged `v42` too.
 - **`v0` means a developer build** – built on someone's computer, not a release.
 - Why not count on each computer? A local counter gives different code the same number (your `v5` is not a colleague's `v5`), and it resets whenever Jenkins checks out a fresh copy.
 - To try a number locally: `.\mvnw.cmd clean package -DbuildNumber=5` creates `simple-spring-boot-app-v5.jar`.
 - The number is only in the JAR file name. The Maven project `<version>` in `pom.xml` (`0.0.1-SNAPSHOT`) does not change.
 - Use `clean package` so that `target/` contains only the latest JAR.
 
-## Jenkins Pipeline
+## Jenkins CI/CD Pipeline
 
-The `Jenkinsfile` defines what Jenkins does for every build:
+On every push to GitHub, the `Jenkinsfile` runs these stages on Jenkins (Windows + Docker Desktop):
 
-1. Checks out the code from Git (automatic).
-2. **Build and Test** stage: runs `mvnw clean package -B -DbuildNumber=<Jenkins build number>`, which compiles the code, runs the tests, and builds the JAR. It works on both Linux (`./mvnw`) and Windows (`mvnw.cmd`) agents.
-3. After the build: publishes the test results, and if the build succeeded, archives the JAR.
+```text
+Checkout ▶ Build ▶ Unit Tests ▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ▶ Docker Pull ▶ Deploy ▶ Smoke Test
+```
 
-### Prerequisites on the Jenkins server
+The result is the image `<docker-hub-username>/simple-spring-boot-app:v<build number>` on Docker Hub and a running container at `http://localhost:8080/api/hello`.
 
-- **JDK 21** on the agent (`java -version` shows 21, or `JAVA_HOME` points to JDK 21). Maven is not needed – the Maven Wrapper downloads it.
-- **Internet access** from the agent for the first build (to download Maven and dependencies).
-- Plugins: **Pipeline**, **Git**, and **JUnit** – all included in Jenkins' "Install suggested plugins".
-
-### Create the Jenkins job
-
-1. Push this project to a Git repository. The `Jenkinsfile` expects `pom.xml` and `Jenkinsfile` to be in the repository root.
-2. In Jenkins, click **New Item**, enter a name, choose **Pipeline**, and click **OK**.
-3. In the **Pipeline** section, set **Definition** to **Pipeline script from SCM**.
-4. Set **SCM** to **Git**, enter the repository URL (and credentials if the repository is private), and the branch to build (for example `*/main`).
-5. Set **Script Path** to `Jenkinsfile`.
-6. Click **Save**, then **Build Now**.
-
-### After a build
-
-On the build's page in Jenkins:
-
-- **Console Output** – the full Maven log.
-- **Test Result** – the JUnit test results.
-- **Build Artifacts** – download `simple-spring-boot-app-v<build number>.jar`.
+**Setup:** follow [CICD-GUIDE.md](CICD-GUIDE.md) – GitHub, Jenkins, plugins, Docker, Docker Hub, credentials, webhook, verifying each stage, and troubleshooting.
+The same guide in Tamil, with more detail on installing Jenkins and Docker Desktop: [JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md](JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md).
 
 ## Starting the Application
 

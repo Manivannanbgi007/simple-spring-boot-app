@@ -34,6 +34,12 @@
             <artifactId>spring-boot-starter-webmvc</artifactId>
         </dependency>
 
+        <!-- Spring Boot Actuator: provides the health check endpoint GET /actuator/health -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
         <!-- Testing support for Spring MVC: JUnit 5, MockMvc, AssertJ -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

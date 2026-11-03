@@ -1,0 +1,11 @@
+# Maven build output (recreated by every build)
+target/
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Operating system files
+.DS_Store
+Thumbs.db
