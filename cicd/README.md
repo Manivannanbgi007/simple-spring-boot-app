@@ -410,7 +410,8 @@ GitHub must reach Jenkins from the internet. `http://localhost:8079` exists only
    docker compose logs ngrok
    ```
 
-   The log contains a line with `url=https://<name>.ngrok-free.app` – that is Jenkins' public address. Free accounts
+   The log contains a line with `url=https://<name>.ngrok-free.app` (newer accounts: `.ngrok-free.dev`) – that is
+   Jenkins' public address. Free accounts
    get one fixed domain (ngrok dashboard → **Domains**), so the address stays the same after restarts.
 3. GitHub repository → **Settings** → **Webhooks** → edit the existing webhook (from the old setup) or **Add webhook**:
 
@@ -973,6 +974,7 @@ Engine gets a new major version (`docker version` → Server).
 | Smoke Test fails after all retries                                              | The application doesn't start                                      | `docker logs simple-spring-boot-app` |
 | `denied: requested access to the resource is denied` (push)                     | `DOCKER_IMAGE` isn't under your Docker Hub user, or the token is read-only | Fix `DOCKER_IMAGE` in the Jenkinsfile; **Read & Write** token |
 | GitHub delivery shows **200** but no build starts                               | The job never ran, or the push was to another branch               | Run the job once by hand ([Step 10](#step-10--run-the-pipeline)); push to `GITHUB_BRANCH` |
+| GitHub delivery shows **403**                                                   | The Payload URL is only the ngrok address, without `/github-webhook/` (Jenkins' login page answers) | Payload URL `https://<name>.ngrok-free.app/github-webhook/`, then **Redeliver** |
 | GitHub delivery shows **400**                                                   | The webhook's Secret is empty or differs from `GITHUB_WEBHOOK_SECRET` | Copy the value from `.env` into the webhook's **Secret**, then **Redeliver** |
 | GitHub delivery fails (`failed to connect`, timeout)                            | PC: ngrok not running. EC2: security group closed, or the address changed | `docker compose --profile tunnel up -d` / check the security group and the Elastic IP |
 | ngrok log: the endpoint is already online                                       | Another ngrok (e.g. the old one on Windows) uses your domain       | Stop the other ngrok |
