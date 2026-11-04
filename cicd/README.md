@@ -5,7 +5,9 @@ This folder runs the complete CI/CD environment for `simple-spring-boot-app` as 
 and the same files work on **Windows with Docker Desktop** and on **Ubuntu Linux** (for example an AWS EC2 instance).
 
 On every push to GitHub, Jenkins builds and tests the application, checks it with SonarQube, packages the JAR,
-builds a Docker image, pushes it to Docker Hub and deploys it – the same 13 stages as before.
+builds a Docker image, scans it for vulnerabilities, pushes it to Docker Hub, tests the new image in a temporary
+container and only then deploys it – with an automatic rollback if the new version fails. 13 stages in total
+([Step 12](#step-12--check-every-stage)); the previous, simpler pipeline is kept in `Jenkinsfile.backup`.
 
 ---
 
@@ -16,7 +18,7 @@ builds a Docker image, pushes it to Docker Hub and deploys it – the same 13 st
 - [Folder structure](#folder-structure)
 - [What replaced the manual Windows setup](#what-replaced-the-manual-windows-setup)
 - [Part 1 – Set up on Windows (Docker Desktop)](#part-1--set-up-on-windows-docker-desktop) – Steps 1–13
-- [Part 2 – Move to Ubuntu on AWS EC2](#part-2--move-to-ubuntu-on-aws-ec2) – Steps E1–E7
+- [Part 2 – Move to Ubuntu on AWS EC2](#part-2--move-to-ubuntu-on-aws-ec2) – separate guide: [AWS-EC2-GUIDE.md](AWS-EC2-GUIDE.md)
 - [The files explained](#the-files-explained)
 - [Persistent data (volumes)](#persistent-data-volumes)
 - [Everyday commands](#everyday-commands)
@@ -46,7 +48,7 @@ you – they are in [Part 2](#part-2--move-to-ubuntu-on-aws-ec2):
 
 | Host setting                      | Windows (Docker Desktop)         | Ubuntu (EC2)                                      |
 |-----------------------------------|----------------------------------|---------------------------------------------------|
-| Kernel limit for SonarQube's search engine (`vm.max_map_count`) | already set by Docker Desktop | one `sysctl` command ([E3](#step-e3--prepare-the-host-for-sonarqube-and-jenkins)) |
+| Kernel limit for SonarQube's search engine (`vm.max_map_count`) | already set by Docker Desktop | set by `scripts/setup-ubuntu-host.sh` ([guide](AWS-EC2-GUIDE.md#step-3--launch-the-instance-with-automatic-setup)) |
 | Group that owns the Docker socket (`DOCKER_GID` in `.env`) | `0`             | the `docker` group's number, e.g. `988`           |
 | Network access from outside       | localhost + ngrok for the GitHub webhook | AWS security group rules                  |
 
@@ -87,7 +89,9 @@ SonarQube analyses) can be carried over with the [backup and restore](#backup-an
 | `sonarqube-db`      | `postgres:17`                          | none             | SonarQube's database                    |
 | `ngrok` (optional)  | `ngrok/ngrok:3.39.13-alpine`           | none             | Public HTTPS address for the GitHub webhook on a PC |
 | `backup` (on demand)| `postgres:17`                          | none             | Backup and restore                      |
-| `simple-spring-boot-app` | `manivannanbgi/simple-spring-boot-app:v<N>` | **8080** | The application, started by the pipeline (not by Compose) |
+| `simple-spring-boot-app` | `manivannanbgi/simple-spring-boot-app:v<N>-<commit>` | **8080** | The application, started by the pipeline (not by Compose) |
+| `simple-spring-boot-app-candidate` | the new image | none | Temporary: the pipeline tests a new image in it before it goes live, then removes it |
+| Trivy (one per build) | `aquasec/trivy:0.76.1`, pinned by digest | none | Temporary: scans the new image for vulnerabilities (cache: volume `trivy-cache`) |
 
 Containers in the same network reach each other **by service name**: Jenkins calls `http://sonarqube:9000`, SonarQube
 calls `http://jenkins:8080`, and the Smoke Test calls `http://simple-spring-boot-app:8080`. Inside a container,
@@ -100,11 +104,14 @@ calls `http://jenkins:8080`, and the Smoke Test calls `http://simple-spring-boot
 ```text
 simple-spring-boot-app/
 ├── .gitattributes                  # NEW: keeps Unix line endings for files used inside Linux containers
-├── Jenkinsfile                     # CHANGED: Linux commands (sh) instead of Windows commands (bat)
+├── Jenkinsfile                     # CHANGED: Linux commands (sh); scan, candidate test and rollback
+├── Jenkinsfile.backup              # the previous Jenkinsfile (same 13-stage idea, no scan, no rollback)
+├── Dockerfile                      # CHANGED: pinned base image, HEALTHCHECK, JVM memory setting
 ├── mvnw                            # CHANGED: marked as executable in Git (needed on Linux)
-├── Dockerfile, pom.xml, src/, ...  # the application – unchanged
+├── pom.xml, src/, ...              # the application – unchanged
 └── cicd/                           # NEW: the CI/CD environment
-    ├── README.md                   # this guide
+    ├── README.md                   # this guide (reference for every file and setting)
+    ├── AWS-EC2-GUIDE.md            # step-by-step setup on an AWS EC2 instance
     ├── docker-compose.yml          # all services, volumes, networks and secrets
     ├── .env.example                # template for .env (all settings, no secrets)
     ├── .env                        # YOUR settings and secrets – created by you, never committed
@@ -113,6 +120,11 @@ simple-spring-boot-app/
     │   ├── Dockerfile              # Jenkins image: Jenkins LTS + Java 21 + Docker CLI + plugins + configuration
     │   ├── plugins.txt             # Jenkins plugins with exact versions
     │   └── casc.yaml               # Jenkins configuration as code: users, credentials, SonarQube, pipeline job
+    ├── scripts/
+    │   ├── setup-ubuntu-host.sh    # prepares an Ubuntu server: Docker, Compose, kernel settings, swap, log rotation
+    │   └── create-env.sh           # creates .env with new random passwords and secrets
+    ├── aws/
+    │   └── user-data.sh            # EC2 user data: clones the repository and runs both scripts at the first boot
     ├── backup/
     │   ├── backup.sh               # backs up Jenkins data + SonarQube database
     │   └── restore.sh              # restores such a backup
@@ -399,7 +411,7 @@ volume (later builds reuse them). **Run this first build by hand** – after it,
 
 GitHub must reach Jenkins from the internet. `http://localhost:8079` exists only on your PC, so on a PC the optional
 **ngrok** container gives Jenkins a public HTTPS address. (On EC2 you use the instance's address instead –
-[Step E5](#step-e5--start-and-finish-the-setup).)
+[AWS-EC2-GUIDE.md, Step 11](AWS-EC2-GUIDE.md#step-11--build-on-every-push-github-webhook).)
 
 1. Create a free account at https://ngrok.com → dashboard → **Your Authtoken** → copy it into `.env`:
    `NGROK_AUTHTOKEN=...`
@@ -442,24 +454,31 @@ that stage's log; the full log is in **Console Output**.
 
 | #  | Stage              | What happens                                                | Success looks like this in the log |
 |----|--------------------|-------------------------------------------------------------|------------------------------------|
-| 1  | Checkout           | Gets the code from GitHub                                   | `Checking out Revision 1a2b3c… (refs/remotes/origin/master)` |
-| 2  | Build              | Compiles (`./mvnw -B clean compile`)                        | `BUILD SUCCESS` |
-| 3  | Unit Tests         | Runs the unit tests (`./mvnw -B test`) and JaCoCo coverage  | `Tests run: 5, Failures: 0, Errors: 0, Skipped: 0` |
+| 1  | Checkout           | Gets the code from GitHub; sets the image tag `v<N>-<commit>` | `Checking out Revision 1a2b3c… (refs/remotes/origin/master)`, `Image tag: v42-1a2b3c4` |
+| 2  | Build              | Compiles (`./mvnw -B -ntp clean compile`)                   | `BUILD SUCCESS` |
+| 3  | Unit Tests         | Runs the unit tests (`./mvnw -B -ntp test`) and JaCoCo coverage | `Tests run: 5, Failures: 0, Errors: 0, Skipped: 0` |
 | 4  | Integration Tests  | Starts the application on a random port, tests it over HTTP | `Tests run: 8, Failures: 0, Errors: 0, Skipped: 0` |
 | 5  | SonarQube Analysis | Sends code, test results and coverage to SonarQube          | `ANALYSIS SUCCESSFUL, you can find the results at: http://localhost:9000/dashboard?id=simple-spring-boot-app` |
 | 6  | Quality Gate       | Waits for SonarQube's verdict (webhook)                     | `SonarQube task '…' completed. Quality gate is 'OK'` |
 | 7  | Package JAR        | Builds and archives the JAR                                 | `Building jar: /var/jenkins_home/workspace/simple-spring-boot-app/target/simple-spring-boot-app-v<N>.jar` |
-| 8  | Docker Build       | Builds the image, tagged `v<N>` and `latest`                | `naming to docker.io/manivannanbgi/simple-spring-boot-app:v<N> done` |
-| 9  | Docker Login       | Logs in to Docker Hub with the token                        | `Login Succeeded` |
-| 10 | Docker Push        | Uploads both tags                                           | `v<N>: digest: sha256:…` |
-| 11 | Docker Pull        | Deletes the local copy, downloads it from Docker Hub        | `Status: Downloaded newer image for manivannanbgi/simple-spring-boot-app:v<N>` |
-| 12 | Deploy             | Replaces the running container                              | a 64-character container ID |
-| 13 | Smoke Test         | Calls the API of the new container                          | `{"message":"Hello! Spring Boot application is running successfully."}` |
+| 8  | Docker Build       | Builds the image, tagged `v<N>-<commit>` and `latest`, with commit/version labels | `naming to docker.io/manivannanbgi/simple-spring-boot-app:v<N>-<commit> done` |
+| 9  | Image Scan         | Trivy scans OS packages and Java libraries; stops on fixable HIGH/CRITICAL vulnerabilities | a table with `0` for `ubuntu` and `app/app.jar` |
+| 10 | Docker Push        | Logs in to Docker Hub with the token, uploads both tags     | `Login Succeeded`, `v<N>-<commit>: digest: sha256:…` |
+| 11 | Candidate Test     | Starts the new image as `simple-spring-boot-app-candidate` (no public port) and checks it; the running application isn't touched | `{"groups":["liveness","readiness"],"status":"UP"}` and the API message |
+| 12 | Deploy             | Remembers the running version, then replaces the container  | `Running now: manivannanbgi/simple-spring-boot-app:v<N-1>-…`, a 64-character container ID |
+| 13 | Smoke Test         | Checks `/actuator/health` and the API of the live container | `{"groups":["liveness","readiness"],"status":"UP"}`, `{"message":"Hello! Spring Boot application is running successfully."}` |
 
-After the stages, **Declarative: Post Actions** logs out of Docker Hub: `Removing login credentials for https://index.docker.io/v1/`.
+After the stages, **Declarative: Post Actions** logs out of Docker Hub (`Removing login credentials for https://index.docker.io/v1/`)
+and, after a successful build, deletes local image versions older than the 3 newest (Docker Hub keeps all of them).
+If the Deploy or Smoke Test stage failed, it **rolls back**: `ROLLBACK: starting the previous version … again`, then
+`ROLLBACK done: … is running`.
 
-`<N>` is the Jenkins build number. In the Smoke Test you may first see
-`curl: (7) Failed to connect to simple-spring-boot-app port 8080` – normal: the application was still starting and curl retried.
+`<N>` is the Jenkins build number, `<commit>` the first 7 characters of the Git commit. In the Candidate Test and the
+Smoke Test you may first see `curl: (7) Failed to connect to … port 8080` – normal: the application was still starting
+and curl retried (for up to about a minute).
+
+The first build after this change takes about 2 minutes longer: Trivy downloads its vulnerability database once into
+the `trivy-cache` volume.
 
 **Check the application:** open http://localhost:8080/api/hello. The image is on Docker Hub under **Tags**, and the
 build page shows the test results, the JAR under **Build Artifacts** and a **SonarQube Quality Gate** badge.
@@ -480,155 +499,20 @@ Keep JDK 21 and Git – you still use them to develop. The CI/CD environment no 
 
 ## Part 2 – Move to Ubuntu on AWS EC2
 
-The same files, the same commands. Only the host preparation and a few `.env` values differ.
+The same files and the same `docker compose up -d --build` run on an Ubuntu EC2 instance. The complete step-by-step
+guide – AWS key pair, security group, instance, Elastic IP, the automatic server setup, `.env`, the SSH tunnel, the
+one-time SonarQube and GitHub steps, backups, security and the way to other AWS services – is a separate document:
 
-### Step E1 – Create the EC2 instance
+**[AWS-EC2-GUIDE.md](AWS-EC2-GUIDE.md)**
 
-| Setting            | Recommended value                                                                          |
-|--------------------|--------------------------------------------------------------------------------------------|
-| AMI                | **Ubuntu Server 24.04 LTS** (64-bit x86)                                                    |
-| Instance type      | **t3.large** (2 vCPU, 8 GiB) at least – SonarQube alone uses 2–3 GiB. `t3.medium` (4 GiB) is too small. |
-| Storage            | **30 GiB gp3** or more (images, Maven cache, build history)                                |
-| Key pair           | Create one and keep the `.pem` file – you need it for `ssh` and `scp`                       |
-| Elastic IP         | Allocate one and associate it with the instance, so its address doesn't change on restart (the GitHub webhook uses it) |
+In short, what differs from the Windows setup:
 
-**Security group (inbound rules)** – open only what is needed, and only to whom:
-
-| Port | Who needs it                                   | Source                                                         |
-|------|------------------------------------------------|----------------------------------------------------------------|
-| 22   | You (SSH)                                      | **My IP**                                                      |
-| 8079 | You (Jenkins UI) and GitHub (webhook)          | **My IP** + GitHub's webhook ranges (the `hooks` list at https://api.github.com/meta) |
-| 9000 | You (SonarQube UI)                             | **My IP**                                                      |
-| 8080 | Users of the deployed application              | as needed                                                      |
-
-> Even safer: open 8079 only for GitHub's ranges and 9000 not at all, and reach both UIs through SSH:
-> `ssh -i key.pem -L 8079:localhost:8079 -L 9000:localhost:9000 ubuntu@<elastic-ip>`, then open
-> http://localhost:8079 and http://localhost:9000 on your PC. The connection is encrypted by SSH.
-
-### Step E2 – Install Docker Engine and Docker Compose
-
-Connect: `ssh -i key.pem ubuntu@<elastic-ip>`. Then install Docker from **Docker's own repository** (Ubuntu's
-`docker.io` package and the snap package are older or behave differently):
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" \
-  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-sudo apt-get update
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-# Let the 'ubuntu' user run docker without sudo, then log out and in again
-sudo usermod -aG docker "$USER"
-exit
-```
-
-**Check** (after `ssh` again):
-
-```bash
-docker version                 # Client and Server
-docker compose version         # v2.30 or newer
-docker run --rm hello-world    # "Hello from Docker!"
-systemctl is-enabled docker    # enabled = Docker (and with it all containers) starts at boot
-```
-
-### Step E3 – Prepare the host for SonarQube and Jenkins
-
-**SonarQube's search engine** needs a higher kernel limit. Set it now and for every future boot:
-
-```bash
-echo "vm.max_map_count=524288" | sudo tee /etc/sysctl.d/99-sonarqube.conf
-sudo sysctl --system
-sysctl vm.max_map_count        # vm.max_map_count = 524288
-```
-
-**The Docker socket's group:** Jenkins may run docker commands only as a member of the group that owns
-`/var/run/docker.sock`. Find its number:
-
-```bash
-getent group docker | cut -d: -f3      # for example 988 - you need it for DOCKER_GID in Step E4
-```
-
-### Step E4 – Get the files and create `.env`
-
-```bash
-git clone https://github.com/Manivannanbgi007/simple-spring-boot-app.git
-cd simple-spring-boot-app/cicd
-cp .env.example .env
-chmod 600 .env                 # only you can read it
-nano .env
-```
-
-Fill in `.env` as in [Step 5](#step-5--create-the-env-file), with these differences:
-
-| Variable             | On EC2                                                                               |
-|----------------------|--------------------------------------------------------------------------------------|
-| `JENKINS_PUBLIC_URL` | `http://<elastic-ip or public DNS name>:8079/` (or `http://localhost:8079/` if you use the SSH tunnel) |
-| `DOCKER_GID`         | the number from Step E3, e.g. `988`                                                  |
-| `NGROK_AUTHTOKEN`    | leave empty – not needed on EC2                                                      |
-
-Use **new** passwords and tokens for the server (a separate Docker Hub token makes it easy to revoke one machine's
-access), unless you carry over your data in Step E6.
-
-### Step E5 – Start and finish the setup
-
-```bash
-docker compose up -d --build
-docker compose ps              # wait for (healthy)
-```
-
-Then do [Steps 7–12](#step-7--set-up-sonarqube-one-time) as on Windows, with the EC2 address instead of `localhost`:
-
-- SonarQube **Server base URL**: `http://<elastic-ip>:9000` (or `http://localhost:9000` with the SSH tunnel).
-- The SonarQube **webhook** is the same: `http://jenkins:8080/sonarqube-webhook/`.
-- **GitHub webhook Payload URL:** `http://<elastic-ip>:8079/github-webhook/` – no ngrok needed. If the PC's Jenkins
-  should stop building, delete (or deactivate) its webhook in GitHub.
-
-### Step E6 – Take your data along (optional)
-
-To keep the build history and the SonarQube analyses from the PC:
-
-1. **On the PC**, in the `cicd` folder – make a backup ([details](#backup-and-restore)):
-
-   ```powershell
-   docker compose stop jenkins
-   docker compose run --rm backup
-   docker compose start jenkins
-   ```
-
-2. Copy the backup folder to the server (Windows 10/11 include `scp`):
-
-   ```powershell
-   scp -i key.pem -r backups\2026-11-03_0930 ubuntu@<elastic-ip>:~/simple-spring-boot-app/cicd/backups/
-   ```
-
-3. **On the server**, after Step E5's `docker compose up -d` has created the volumes:
-
-   ```bash
-   docker compose stop jenkins sonarqube
-   docker compose run --rm backup restore.sh 2026-11-03_0930
-   docker compose start jenkins sonarqube
-   ```
-
-4. The SonarQube database now comes from the PC, so on the server use the **PC's** `SONAR_TOKEN` and
-   `SONAR_WEBHOOK_SECRET` in `.env` (`docker compose up -d --force-recreate jenkins`), log in to SonarQube with the
-   PC's admin password, and set **Server base URL** to the server's address. Jenkins' settings come from the server's
-   `.env` and `casc.yaml` as usual.
-
-### Step E7 – Before real production use
-
-The setup above is complete and works. For a team server on the internet, plan these next:
-
-- **HTTPS** in front of Jenkins and SonarQube – an AWS Application Load Balancer with an ACM certificate, or a
-  reverse proxy container (for example Caddy or nginx). Until then, use the SSH tunnel or restrict the security group.
-- **Automatic backups**, for example a nightly cron job that runs the backup and copies `backups/` to S3
-  (`aws s3 sync backups s3://<bucket>/cicd-backups/`).
-- **A separate build agent** (see [Security notes](#security-notes)).
-- **Amazon RDS for PostgreSQL** instead of the `sonarqube-db` container: point `SONAR_JDBC_URL` in
-  `docker-compose.yml` at the RDS endpoint and remove the `sonarqube-db` service.
+| On Windows (Part 1) | On EC2 |
+|---------------------|--------|
+| Docker Desktop installed by hand | `aws/user-data.sh` runs `scripts/setup-ubuntu-host.sh` at the first boot: Docker Engine, Compose, `vm.max_map_count`, swap, log rotation |
+| `.env` filled in by hand | `scripts/create-env.sh` creates it with new random secrets, the right `DOCKER_GID` and the Jenkins address; you add only the Docker Hub token (and later the SonarQube token) |
+| `localhost:8079` / `localhost:9000` | through an SSH tunnel: `localhost:18079` / `localhost:19000` – the ports stay closed to the internet |
+| GitHub webhook through ngrok | directly to `http://<elastic-ip>:8079/github-webhook/`, open only for GitHub's webhook addresses |
 
 ---
 
@@ -756,7 +640,7 @@ from the secret files in `/run/secrets/`, and `${name:-}` means "empty if not se
 
 ### Jenkinsfile – what changed
 
-The 13 stages are the same. Jenkins now runs in a **Linux** container, so the commands changed:
+Compared with the Windows `Jenkinsfile`, Jenkins now runs in a **Linux** container, so the commands changed:
 
 | Before (Windows Jenkins)                               | Now (Linux container)                                         | Why |
 |--------------------------------------------------------|---------------------------------------------------------------|-----|
@@ -771,6 +655,27 @@ The 13 stages are the same. Jenkins now runs in a **Linux** container, so the co
 The `docker` commands run on the **host's** Docker Engine (through the socket). So the image and the deployed container
 appear in `docker images` / `docker ps` on the host, exactly as before. One consequence for future changes: in a
 `docker run -v <path>:...` inside the pipeline, `<path>` would be a path on the **host**, not in the Jenkins container.
+
+**Production safeguards** in the current `Jenkinsfile` (the previous version without them is `Jenkinsfile.backup`):
+
+| Safeguard | How | Why |
+|-----------|-----|-----|
+| One build at a time | `options { disableConcurrentBuilds() }` | Two quick pushes would otherwise deploy at the same moment – the older build could finish last and put the older version back |
+| Unique image tags | `IMAGE_TAG = v<N>-<commit>`, set in the Checkout stage; labels `org.opencontainers.image.revision` / `.version` | Build numbers start again at 1 on a new Jenkins – `v1` would overwrite an old image on Docker Hub. The commit shows what is inside |
+| Vulnerability scan before the push | **Image Scan** stage: Trivy, `--severity HIGH,CRITICAL --ignore-unfixed --exit-code 1` | A vulnerable image is never published or deployed. Only problems that already have a fix stop the build |
+| Least privilege for the scanner | the image is passed as a file (`docker save … \| docker run -i …`); Trivy pinned by digest | Trivy gets no Docker socket, and a re-pushed tag can't change the scanner (this happened with Trivy in March 2026) |
+| Test before the switch | **Candidate Test**: the new image runs as a temporary container and must report `UP` and answer the API | An image that doesn't start never replaces the running application |
+| Automatic rollback | **Deploy** remembers the running image; `post { unsuccessful { … } }` starts it again if Deploy or Smoke Test failed | A version that fails after the switch is replaced by the previous one within about a minute |
+| Health and memory | Dockerfile `HEALTHCHECK` (`/actuator/health`), `--memory 512m`, `-XX:MaxRAMPercentage=75` | `docker ps` shows `(healthy)`; a memory leak can't take the whole host down |
+| Reproducible base image | `FROM eclipse-temurin:21.0.13_9-jre-resolute@sha256:…` | `21-jre` moves: it already changed from Ubuntu 24.04 to 26.04. Updates are now deliberate ([Upgrading](#upgrading)) |
+| Disk housekeeping | `post { success { … } }` keeps the 3 newest image versions on the host | Every build adds an image; the 3 newest are enough for a rollback |
+| No redundant stages | the old **Docker Pull** stage is gone; **Docker Login** is part of **Docker Push** | On one host, pulling the image just pushed adds time and a failure point, not safety |
+
+**Downtime:** the switch itself still has a few seconds of downtime (the old container must free port 8080 before the
+new one starts). Zero downtime needs a reverse proxy (for example Traefik or nginx) in front of two containers.
+
+**Back to the previous pipeline:** copy `Jenkinsfile.backup` over `Jenkinsfile` and push – or set
+`scriptPath('Jenkinsfile.backup')` in `jenkins/casc.yaml` and run `docker compose up -d --build`.
 
 ### backup/, .gitattributes, .gitignore
 
@@ -903,7 +808,7 @@ docker compose start jenkins sonarqube
 SonarQube then rebuilds its search index, which takes a minute or two longer than a normal start.
 
 **Restore on a new machine** (for example EC2): first `docker compose up -d` once so the volumes and the database
-exist, then the three commands above – see [Step E6](#step-e6--take-your-data-along-optional).
+exist, then the three commands above – see [AWS-EC2-GUIDE.md](AWS-EC2-GUIDE.md#backups-and-moving-to-a-new-instance).
 
 > On Linux the backup files belong to `root` (they are written by a container). Delete old backups with `sudo rm -r backups/<folder>`.
 
@@ -933,6 +838,17 @@ then restore. Check the new image's notes first – PostgreSQL 18 images use a d
 
 **Docker CLI in the Jenkins image** – `docker:29.9.2-cli` in `jenkins/Dockerfile`. Update it when the host's Docker
 Engine gets a new major version (`docker version` → Server).
+
+**Application base image** – `FROM eclipse-temurin:<version>-jre-resolute@sha256:<digest>` in the project's
+`Dockerfile`. Java gets security updates four times a year (January, April, July, October). Find the new tag on
+https://hub.docker.com/_/eclipse-temurin/tags (name filter `21.0.`, ending in `-jre-resolute`), copy its **index
+digest** (`sha256:…`), change both in the `Dockerfile`, commit and push – the Image Scan checks the result. Also update
+it when the Image Scan reports fixable vulnerabilities in `ubuntu`.
+
+**Trivy** – `TRIVY_IMAGE` in the `Jenkinsfile` (tag **and** digest). Check the release notes and security advisories
+first (https://github.com/aquasecurity/trivy/releases, https://github.com/aquasecurity/trivy/security/advisories);
+versions 0.69.4–0.69.6 were malicious (March 2026 compromise). Take the digest from
+https://hub.docker.com/r/aquasec/trivy/tags.
 
 ---
 
@@ -968,10 +884,16 @@ Engine gets a new major version (`docker version` → Server).
 | Webhook delivery fails; Jenkins log shows `Invalid payload` / `signature`        | The secret in SonarQube and `SONAR_WEBHOOK_SECRET` differ          | Make them equal, `docker compose up -d --force-recreate jenkins` |
 | Links in the build log point to `http://sonarqube:9000/...`                     | SonarQube's **Server base URL** isn't set                          | [Step 7.2](#step-7--set-up-sonarqube-one-time) |
 | `Pipeline aborted due to quality gate failure: ERROR`                           | The code failed the quality gate – the gate is working             | Open the SonarQube dashboard, fix the listed conditions, push |
-| SonarQube stops; log: `max virtual memory areas vm.max_map_count [65530] is too low` | Kernel limit not set (Ubuntu)                                  | [Step E3](#step-e3--prepare-the-host-for-sonarqube-and-jenkins) |
+| SonarQube stops; log: `max virtual memory areas vm.max_map_count [65530] is too low` | Kernel limit not set (Ubuntu)                                  | `sudo bash scripts/setup-ubuntu-host.sh` ([AWS-EC2-GUIDE.md](AWS-EC2-GUIDE.md#troubleshooting-aws-specific)) |
 | A container stops with exit code **137**, or `OutOfMemoryError`                 | Not enough memory                                                  | Docker Desktop: [Step 1](#step-1--docker-desktop). EC2: a larger instance (8 GiB+) |
-| Smoke Test: `Could not resolve host: simple-spring-boot-app`                    | The application container isn't in `cicd-network`                 | The Deploy stage must use `--network "$DOCKER_NETWORK"`; check `DOCKER_NETWORK = 'cicd-network'` |
-| Smoke Test fails after all retries                                              | The application doesn't start                                      | `docker logs simple-spring-boot-app` |
+| Smoke Test: `Could not resolve host: simple-spring-boot-app`                    | The application container isn't in `cicd-network`                 | Check `DOCKER_NETWORK = 'cicd-network'` in the Jenkinsfile (`startApp` uses it) |
+| Image Scan fails; the table lists `HIGH` / `CRITICAL` vulnerabilities           | The image contains a known vulnerability that already has a fix    | In `ubuntu`: update the base image ([Upgrading](#upgrading)). In `app/app.jar`: update the library (usually the Spring Boot version in `pom.xml`). The table names the package and the fixed version |
+| Image Scan: `failed to download vulnerability DB` / `context deadline exceeded` | No internet access to `mirror.gcr.io`                              | Check the network; run the build again (the database is cached in `trivy-cache` once downloaded) |
+| Candidate Test fails after all retries; the log ends with the candidate's `docker logs` | The new image doesn't start or isn't healthy                 | Read the printed log lines (the running application was not changed); reproduce with `docker run --rm -p 8081:8080 manivannanbgi/simple-spring-boot-app:<tag>` |
+| Smoke Test fails, then `ROLLBACK: starting the previous version …`              | The new version failed after the switch                            | The previous version is running again (`ROLLBACK done`). The new version's log is printed just before the rollback |
+| `No previous version to roll back to - the failed container was removed`         | The very first deployment failed                                   | Fix the cause (log above that line), push again |
+| `WARNING: the previous version … does not answer either`                         | The rollback started, but the old version doesn't answer           | `docker logs simple-spring-boot-app`; usually a shared problem (network, memory) rather than the code |
+| `Unable to find image '…' locally` during a rollback                            | The previous image was deleted on the host                         | Nothing to do – Docker downloads it from Docker Hub, where all versions are kept |
 | `denied: requested access to the resource is denied` (push)                     | `DOCKER_IMAGE` isn't under your Docker Hub user, or the token is read-only | Fix `DOCKER_IMAGE` in the Jenkinsfile; **Read & Write** token |
 | GitHub delivery shows **200** but no build starts                               | The job never ran, or the push was to another branch               | Run the job once by hand ([Step 10](#step-10--run-the-pipeline)); push to `GITHUB_BRANCH` |
 | GitHub delivery shows **403**                                                   | The Payload URL is only the ngrok address, without `/github-webhook/` (Jenkins' login page answers) | Payload URL `https://<name>.ngrok-free.app/github-webhook/`, then **Redeliver** |
@@ -1000,7 +922,10 @@ Engine gets a new major version (`docker version` → Server).
 - **Webhooks:** both webhooks into Jenkins are signed – GitHub → Jenkins (`GITHUB_WEBHOOK_SECRET`) and SonarQube →
   Jenkins (`SONAR_WEBHOOK_SECRET`); Jenkins rejects unsigned or forged requests.
 - **HTTPS:** plain HTTP is fine on your PC and through an SSH tunnel. Before Jenkins or SonarQube are used over the
-  internet with real accounts, put HTTPS in front of them ([Step E7](#step-e7--before-real-production-use)).
+  internet with real accounts, put HTTPS in front of them ([AWS-EC2-GUIDE.md – Future](AWS-EC2-GUIDE.md#future-other-aws-deployment-environments)).
 - **Users:** Jenkins, SonarQube and the application all run as non-root users inside their containers.
 - **Exact versions** of every image and plugin: a rebuild never changes anything by surprise, and an upgrade is a
-  deliberate, reviewable change in Git.
+  deliberate, reviewable change in Git. The application's base image and the Trivy scanner are pinned by **digest**,
+  so even a re-pushed tag can't change them.
+- **Vulnerability scan:** every image is scanned by Trivy before it is pushed; fixable HIGH and CRITICAL findings stop
+  the build. Trivy gets the image as a file and no access to the Docker socket.

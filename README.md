@@ -43,7 +43,8 @@ simple-spring-boot-app/
 ├── cicd/                                    # Jenkins + SonarQube as Docker containers (Docker Compose) - see cicd/README.md
 ├── CICD-GUIDE.md                            # Previous setup: Jenkins as a Windows service
 ├── Dockerfile                               # Builds the Docker image from the JAR
-├── Jenkinsfile                              # Jenkins CI/CD pipeline: build, test, SonarQube, Docker, deploy
+├── Jenkinsfile                              # Jenkins CI/CD pipeline: build, test, SonarQube, scan, deploy with rollback
+├── Jenkinsfile.backup                       # The previous, simpler pipeline (kept as a backup)
 ├── JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md  # Jenkins setup and pipeline guide in Tamil
 ├── mvnw                                     # Maven Wrapper script (macOS / Linux)
 ├── mvnw.cmd                                 # Maven Wrapper script (Windows)
@@ -83,8 +84,8 @@ simple-spring-boot-app/
 - **`HelloControllerUnitTest.java`** – Plain unit test: creates the controller with `new` and checks the `Map` each method returns. No Spring, so it runs in milliseconds.
 - **`HelloControllerTest.java`** – Uses `@WebMvcTest` to load only the web layer and `MockMvc` to send fake HTTP requests. Checks that `GET /api/hello` and `GET /api/new` return `200` with the correct JSON `message`, and that `POST` is rejected with `405`.
 - **`DemoApplicationIT.java`** – Integration test: `@SpringBootTest(webEnvironment = RANDOM_PORT)` starts the whole application on a free port, and `RestTestClient` calls it over real HTTP. Checks both API endpoints, `GET /actuator/health` (`UP`), that other actuator endpoints such as `/actuator/env` are not exposed, and that unknown paths return `404`.
-- **`Jenkinsfile`** – The Jenkins CI/CD pipeline: builds and tests the code, checks it with SonarQube, creates the JAR and Docker image, pushes the image to Docker Hub, and deploys it as a container (see [Jenkins CI/CD Pipeline](#jenkins-cicd-pipeline)).
-- **`Dockerfile`** – Builds a Docker image that runs the JAR on a Java 21 runtime as a non-root user. `.dockerignore` makes Docker read only the JAR.
+- **`Jenkinsfile`** – The Jenkins CI/CD pipeline: builds and tests the code, checks it with SonarQube, creates the JAR and Docker image, scans the image for vulnerabilities, pushes it to Docker Hub, tests it in a temporary container, and deploys it with an automatic rollback (see [Jenkins CI/CD Pipeline](#jenkins-cicd-pipeline)). `Jenkinsfile.backup` is the previous version.
+- **`Dockerfile`** – Builds a Docker image that runs the JAR on a Java 21 runtime (exact version, pinned by digest) as a non-root user, with a `HEALTHCHECK` on `/actuator/health` and a heap limit of 75% of the container's memory. `.dockerignore` makes Docker read only the JAR.
 
 ## Maven Build Commands
 
@@ -123,7 +124,7 @@ The JAR name contains a build number, set by the `buildNumber` property in `pom.
 | Your computer          | `.\mvnw.cmd clean package`                               | `target/simple-spring-boot-app-v0.jar`  |
 | Jenkins build #42      | `mvnw package -DbuildNumber=42` (run by the Jenkinsfile) | `target/simple-spring-boot-app-v42.jar` |
 
-- **Jenkins owns the build number.** Every Jenkins build gets a unique, increasing number (`BUILD_NUMBER`), which the `Jenkinsfile` passes to Maven. So `v42` always means "Jenkins build #42", and you can look up its log, test results, and Git commit in Jenkins. The Docker image of that build is tagged `v42` too.
+- **Jenkins owns the build number.** Every Jenkins build gets a unique, increasing number (`BUILD_NUMBER`), which the `Jenkinsfile` passes to Maven. So `v42` always means "Jenkins build #42", and you can look up its log, test results, and Git commit in Jenkins. The Docker image of that build is tagged `v42-<commit>` (for example `v42-1a2b3c4`), so the tag stays unique even if a new Jenkins starts counting at 1 again.
 - **`v0` means a developer build** – built on someone's computer, not a release.
 - Why not count on each computer? A local counter gives different code the same number (your `v5` is not a colleague's `v5`), and it resets whenever Jenkins checks out a fresh copy.
 - To try a number locally: `.\mvnw.cmd clean package -DbuildNumber=5` creates `simple-spring-boot-app-v5.jar`.
@@ -136,12 +137,14 @@ On every push to GitHub, the `Jenkinsfile` runs these stages on Jenkins. Jenkins
 (`cicd/docker-compose.yml`), the same way on Windows with Docker Desktop and on Ubuntu Linux (for example AWS EC2):
 
 ```text
-Checkout ▶ Build ▶ Unit Tests ▶ Integration Tests ▶ SonarQube Analysis ▶ Quality Gate ▶ Package JAR ▶ Docker Build ▶ Docker Login ▶ Docker Push ▶ Docker Pull ▶ Deploy ▶ Smoke Test
+Checkout ▶ Build ▶ Unit Tests ▶ Integration Tests ▶ SonarQube Analysis ▶ Quality Gate ▶ Package JAR ▶ Docker Build ▶ Image Scan ▶ Docker Push ▶ Candidate Test ▶ Deploy ▶ Smoke Test
 ```
 
-The result is the image `<docker-hub-username>/simple-spring-boot-app:v<build number>` on Docker Hub and a running container at `http://localhost:8080/api/hello`. If the code fails the SonarQube quality gate, the build stops before the Docker stages.
+The result is the image `<docker-hub-username>/simple-spring-boot-app:v<build number>-<commit>` on Docker Hub and a running container at `http://localhost:8080/api/hello`. The build stops before anything is pushed if the code fails the SonarQube quality gate or the image has fixable HIGH/CRITICAL vulnerabilities (Trivy). A new image is tested in a temporary container before it replaces the running one, and if it fails after the switch, the previous version is started again (rollback). Only one build runs at a time. Details: [cicd/README.md – Production safeguards](cicd/README.md#jenkinsfile--what-changed). The previous, simpler pipeline is kept in `Jenkinsfile.backup`.
 
-**Setup:** follow [cicd/README.md](cicd/README.md) – Docker, the Compose services, `.env`, SonarQube, GitHub and Docker Hub authentication, the webhook, verifying each stage, moving to AWS EC2, volumes, backup, and troubleshooting.
+**Setup:** follow [cicd/README.md](cicd/README.md) – Docker, the Compose services, `.env`, SonarQube, GitHub and Docker Hub authentication, the webhook, verifying each stage, volumes, backup, and troubleshooting.
+
+**On AWS:** [cicd/AWS-EC2-GUIDE.md](cicd/AWS-EC2-GUIDE.md) – step by step from a new Ubuntu EC2 instance to the running environment: the instance configures itself at its first boot (`cicd/aws/user-data.sh`), then one `docker compose up -d --build` starts everything.
 
 The previous setup (Jenkins as a Windows service, SonarQube started with `docker run`) is described in [CICD-GUIDE.md](CICD-GUIDE.md) and [SONARQUBE-GUIDE.md](SONARQUBE-GUIDE.md) (Tamil: [JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md](JENKINS_SETUP_AND_PIPELINE_GUIDE_TAMIL.md), [SONARQUBE_GUIDE_TAMIL.md](SONARQUBE_GUIDE_TAMIL.md)). The current `Jenkinsfile` no longer runs on that setup.
 
